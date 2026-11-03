@@ -15,7 +15,7 @@ STM_QA_REAL=1 npm run qa      # same, with real Haiku tagging
 node test/claude-tab.mjs      # real Claude tab: task → evict → transcript tags → close → --resume
 ```
 
-Keys: `⌘T` shell · `⌘⇧T` Claude · `⌘W` close · `⌘1–5` switch · `⌘K` search memory.
+Keys: `⌘T` shell · `⌘⇧T` Claude · `⌘⌥T` Codex · `⌘W` close · `⌘1–5` switch · `⌘K` search memory.
 
 ## Architecture
 
@@ -42,10 +42,19 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
 - **Claude tabs** started from `+ Claude` run `claude --chrome --dangerously-skip-permissions --session-id <uuid>`,
   so the session id is known exactly. A `claude` you start by hand in a shell tab is detected from the
   process tree, and its newest transcript is found under `~/.claude/projects/<cwd-slug>/`.
-- **Your existing Claude Code sessions are imported** from `~/.claude/projects/*/*.jsonl` at startup
-  and every 60s. Only interactive sessions (`entrypoint: "cli"`) with at least one human message are
-  imported; SDK and background sessions (claude-mem observers, `claude -p`) and sessions in temp dirs
-  are skipped. Claude's own `ai-title` is kept as the title, and the transcript becomes searchable. Haiku
+- **Agents are adapters** (`src/agents/`): Claude Code and Codex. Each one knows how to launch, resume,
+  recognize its process, list its sessions, and read a transcript. Adding another agent means adding one file.
+- **Codex has no `--session-id` flag**, but it runs Claude-style `SessionStart` hooks that receive the
+  session id. stm-term idempotently adds `bin/agent-session-hook.sh` to `~/.codex/hooks.json`, keeping
+  any hooks already there; disable with `STM_INSTALL_CODEX_HOOK=0`. The hook does nothing unless
+  `$STM_TAB_ID` is set. Inside a tab it records the session for that tab, so `codex resume <id>` is exact,
+  and a `codex` started by hand in a shell tab turns that tab into a Codex tab. Codex launches with
+  `--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust`.
+- **Your existing agent sessions are imported**: Claude from `~/.claude/projects/*/*.jsonl` and Codex
+  from `~/.codex/sessions/**/rollout-*.jsonl`, at startup and every 60s. Only interactive sessions
+  (Claude `entrypoint: "cli"`; Codex `codex-tui` from the terminal or VS Code) with at least one human
+  message are imported; SDK and background sessions (claude-mem observers, `claude -p`) `codex exec`, subagents, and sessions in temp dirs
+  are skipped. The agent's own title (Claude `ai-title`, Codex `session_index.jsonl`) is kept, and the transcript becomes searchable. Haiku
   tags them in the background, newest first, 2 at a time. A session touched in the last 10 minutes shows
   "active elsewhere" (it may be open in another terminal) and is re-tagged only once it goes quiet.
   Forgetting an imported session leaves a tombstone, so the importer doesn't bring it back.
@@ -89,4 +98,7 @@ UI hooks use `data-testid`: `stm-tab`, `next-evict`, `new-shell`, `new-claude`, 
 `ltm-search`, `memory-item`, `mem-tag`, `tag-filter`, `forget`.
 
 Env: `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_MAX` (5) · `STM_TAGGER` (claude|api|fake) ·
-`STM_CLAUDE_CMD` · `STM_SHELL`.
+`STM_CLAUDE_CMD` · `STM_CODEX_BIN` / `STM_CODEX_CMD` · `STM_SHELL`.
+
+**Tagging failures** (e.g. the Claude CLI mid auto-update) are retried with backoff, then retried
+again on daemon restart. A failed item shows "tagging failed · retry" in the sidebar; hover it for the reason.

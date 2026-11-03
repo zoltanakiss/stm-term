@@ -13,6 +13,9 @@ const terms = new Map(); // id -> { term, fit, el }
 
 const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const ICON = { shell: '&gt;_', claude: '✳', codex: '⌬' };
+const icon = (kind) => ICON[kind] || ICON.shell;
+const MAX_TAGS = 5;
 const home = (p) => String(p || '').replace(/^\/Users\/[^/]+/, '~');
 
 function rel(ts) {
@@ -64,7 +67,7 @@ function ensureTerm(id) {
   try { fit.fit(); } catch {}
   term.onData((d) => send({ type: 'input', id, data: d }));
   term.onResize(({ cols, rows }) => send({ type: 'resize', id, cols, rows }));
-  term.attachCustomKeyEventHandler((e) => !(e.metaKey && /^[tTwkK1-5]$/.test(e.key)));
+  term.attachCustomKeyEventHandler((e) => !(e.metaKey && (/^[wWkK1-5]$/.test(e.key) || e.code === 'KeyT')));
   const T = { term, fit, el };
   terms.set(id, T);
   attach(id);
@@ -109,12 +112,12 @@ function applyState(s) {
 
 function renderTabs() {
   $('#tabs').innerHTML = S.stm.map((t, i) => `
-    <div class="tab ${t.kind === 'claude' ? 'claude' : ''}" role="tab" tabindex="0" data-testid="stm-tab" data-id="${t.id}"
+    <div class="tab ${t.kind} ${t.id === S.nextToEvict ? 'next-out' : ''}" role="tab" tabindex="0" data-testid="stm-tab" data-id="${t.id}"
       aria-selected="${t.id === S.focusedId}" title="${esc(t.title)} — ${esc(home(t.cwd))}  (⌘${i + 1})">
-      <span class="k">${t.kind === 'claude' ? '✳' : '&gt;_'}</span>
+      <span class="k">${icon(t.kind)}</span>
       <span class="n">${esc(t.title)}</span>
       ${t.process === 'exited' ? '<span class="dead" title="process exited">●</span>' : ''}
-      ${t.id === S.nextToEvict ? '<span class="evict" data-testid="next-evict" title="Stalest tab: opening another moves it to long-term memory">next out</span>' : ''}
+      ${t.id === S.nextToEvict ? '<span class="evict" data-testid="next-evict" title="Stalest tab: opening another moves it to long-term memory">↓</span>' : ''}
       <span class="x" data-close="${t.id}" data-testid="close-tab" title="Close (⌘W): archive and stop process">×</span>
     </div>`).join('');
   $('#slots').innerHTML = Array.from({ length: S.max }, (_, i) => `<i class="${i < S.stm.length ? 'on' : ''}"></i>`).join('');
@@ -136,10 +139,11 @@ $('#tabs').addEventListener('click', (e) => {
   if (tab) focusTab(tab.dataset.id);
 });
 $('#new-shell').onclick = () => newTab(false);
-$('#new-claude').onclick = () => newTab(true);
-function newTab(claude) {
+$('#new-claude').onclick = () => newTab('claude');
+$('#new-codex').onclick = () => newTab('codex');
+function newTab(agent) {
   const cur = S && S.stm.find((t) => t.id === S.focusedId);
-  api('POST', '/api/tabs', { claude, cwd: cur ? cur.cwd : undefined });
+  api('POST', '/api/tabs', { agent: agent || undefined, cwd: cur ? cur.cwd : undefined });
 }
 
 // ---------- long-term memory ----------
@@ -168,11 +172,12 @@ function renderMemory(items, tagCounts) {
     if (day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
     const tags = t.tag_status === 'pending' || (t.tag_status === 'queued' && !t.tags.length)
       ? `<span class="tagging" data-testid="tagging">${t.tag_status === 'pending' ? 'tagging…' : 'queued for tagging'}</span>`
-      : t.tags.map((g) => `<button class="tag ${g === tagFilter ? 'active' : ''}" data-tag="${esc(g)}" data-testid="mem-tag">${esc(g)}</button>`).join('')
-        + (t.tag_status === 'error' ? '<span class="tag-error">tagging failed</span>' : '');
+      : t.tags.slice(0, MAX_TAGS).map((g) => `<button class="tag ${g === tagFilter ? 'active' : ''}" data-tag="${esc(g)}" data-testid="mem-tag">${esc(g)}</button>`).join('')
+        + (t.tags.length > MAX_TAGS ? `<span class="more" title="${esc(t.tags.slice(MAX_TAGS).join(', '))}">+${t.tags.length - MAX_TAGS}</span>` : '')
+        + (t.tag_status === 'error' ? `<button class="tag-error" data-retag="${t.id}" data-testid="retag" title="${esc(t.summary)}">tagging failed · retry</button>` : '');
     html += `
-      <div class="mem ${t.kind === 'claude' ? 'claude' : ''}" role="listitem" data-testid="memory-item" data-id="${t.id}" title="Click to bring back into short-term memory">
-        <div class="icon">${t.kind === 'claude' ? '✳' : '&gt;_'}</div>
+      <div class="mem ${t.kind}" role="listitem" data-testid="memory-item" data-id="${t.id}" title="Click to bring back into short-term memory">
+        <div class="icon">${icon(t.kind)}</div>
         <div>
           <div class="t">${esc(t.title)}</div>
           ${t.summary ? `<div class="s">${esc(t.summary)}</div>` : ''}
@@ -183,7 +188,7 @@ function renderMemory(items, tagCounts) {
           <span class="time" title="${esc(new Date(ts).toLocaleString())}">${rel(ts)}</span>
           ${t.active_elsewhere
             ? '<span class="status elsewhere" title="This Claude session was active in the last 10 minutes; it may still be open in another terminal">active elsewhere</span>'
-            : `<span class="status ${t.process}" title="${t.process === 'running' ? 'process still running in the background' : t.kind === 'claude' ? 'restores with claude --resume' : 'saved snapshot; a new shell starts on restore'}">${t.process === 'running' ? '● live' : t.import_source === 'claude' ? 'claude session' : 'snapshot'}</span>`}
+            : `<span class="status ${t.process}" title="${t.process === 'running' ? 'process still running in the background' : t.kind === 'claude' ? `restores with ${t.kind} resume` : 'saved snapshot; a new shell starts on restore'}">${t.process === 'running' ? '● live' : t.import_source ? `${t.import_source} session` : 'snapshot'}</span>`}
           <button class="forget" data-forget="${t.id}" title="Forget permanently" data-testid="forget">×</button>
         </div>
       </div>`;
@@ -199,6 +204,8 @@ $('#ltm').addEventListener('click', (e) => {
   const tagBtn = e.target.closest('[data-tag]');
   if (tagBtn) { e.stopPropagation(); setTag(tagBtn.dataset.tag); return; }
   if (e.target.closest('#filter-chip')) { setTag(tagFilter); return; }
+  const retag = e.target.closest('[data-retag]');
+  if (retag) { e.stopPropagation(); api('POST', `/api/memory/${retag.dataset.retag}/retag`); return; }
   const forget = e.target.closest('[data-forget]');
   if (forget) { api('DELETE', `/api/memory/${forget.dataset.forget}`); return; }
   const item = e.target.closest('.mem');
@@ -214,7 +221,7 @@ $('#search').addEventListener('input', (e) => {
 document.addEventListener('keydown', (e) => {
   if (!e.metaKey) return;
   const k = e.key.toLowerCase();
-  if (k === 't') { e.preventDefault(); newTab(e.shiftKey); }
+  if (k === 't' || e.code === 'KeyT') { e.preventDefault(); newTab(e.altKey ? 'codex' : e.shiftKey ? 'claude' : null); }
   else if (k === 'w' && S && S.focusedId) { e.preventDefault(); api('POST', `/api/tabs/${S.focusedId}/close`); }
   else if (k === 'k') { e.preventDefault(); $('#search').focus(); $('#search').select(); }
   else if (/^[1-5]$/.test(k) && S && S.stm[+k - 1]) { e.preventDefault(); focusTab(S.stm[+k - 1].id); }
