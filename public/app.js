@@ -227,6 +227,51 @@ document.addEventListener('keydown', (e) => {
   else if (/^[1-5]$/.test(k) && S && S.stm[+k - 1]) { e.preventDefault(); focusTab(S.stm[+k - 1].id); }
 }, true);
 
+// ---------- drag & drop / paste files (images for Claude & Codex) ----------
+// Like Terminal/iTerm: dropping a file pastes its path. Bytes go to the daemon (works in a plain
+// browser too, where file paths aren't exposed), which saves them and pastes the saved path.
+// Backslash-escape like Terminal.app does on drop (macOS screenshot names contain spaces).
+const shellEscape = (p) => p.replace(/([ \\'"()&;!$`*?<>|#~{}[\]])/g, '\\$1');
+async function uploadInto(id, files, { preferRealPath = false } = {}) {
+  if (!id || !files.length) return;
+  const T = terms.get(id);
+  const paths = [];
+  for (const f of files) {
+    // In the desktop app a dropped Finder file has a real path: paste that, exactly like other terminals.
+    const real = preferRealPath && window.stmNative ? window.stmNative.pathForFile(f) : null;
+    if (real) { paths.push(shellEscape(real)); continue; }
+    const r = await fetch(`/api/upload?name=${encodeURIComponent(f.name || 'pasted.png')}`, {
+      method: 'POST', headers: { 'x-stm': '1', 'content-type': f.type || 'application/octet-stream' }, body: f,
+    }).then((x) => x.json()).catch((e) => ({ error: String(e) }));
+    if (r.path) paths.push(r.path); else console.warn('upload failed', r.error);
+  }
+  if (T && paths.length) { T.term.paste(`${paths.join(' ')} `); T.term.focus(); }
+}
+const hasFiles = (dt) => dt && [...(dt.types || [])].includes('Files');
+const tabAt = (target) => { const el = target && target.closest && target.closest('.term'); return el ? el.dataset.tabId : null; };
+let dragDepth = 0;
+// Always prevent the default, or Electron/Chrome navigates away to show the dropped file.
+document.addEventListener('dragover', (e) => { if (hasFiles(e.dataTransfer)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+document.addEventListener('dragenter', (e) => { if (hasFiles(e.dataTransfer)) { dragDepth++; $('#terms').classList.add('dropping'); } });
+document.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#terms').classList.remove('dropping'); } });
+document.addEventListener('drop', (e) => {
+  if (!hasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  $('#terms').classList.remove('dropping');
+  const id = tabAt(e.target) || (S && S.focusedId);
+  uploadInto(id, [...e.dataTransfer.files], { preferRealPath: true });
+});
+// ⌘V with an image (e.g. ⌃⇧⌘4 screenshot) on the clipboard: xterm only pastes text, so handle files here.
+document.addEventListener('paste', (e) => {
+  const dt = e.clipboardData;
+  if (!dt || !dt.files || !dt.files.length || dt.getData('text/plain')) return;
+  if (!tabAt(document.activeElement) && !tabAt(e.target)) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  uploadInto(S && S.focusedId, [...dt.files]);
+}, true);
+
 window.addEventListener('resize', () => { if (shownId && terms.get(shownId)) terms.get(shownId).fit.fit(); });
 setInterval(() => { if (memVersion >= 0) loadMemory(); }, 60000); // keep "N min ago" fresh
 connect();

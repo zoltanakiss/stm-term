@@ -23,6 +23,8 @@ const MAX = +(process.env.STM_MAX || 5);
 const SHELL = process.env.STM_SHELL || process.env.SHELL || '/bin/zsh';
 const ROOT = path.join(__dirname, '..');
 const SESSIONS_DIR = path.join(DATA, 'agent-sessions'); // SessionStart hook records, keyed by tab id
+const UPLOADS = path.join(DATA, 'uploads'); // dropped / pasted files, so their paths can be pasted into a tab
+const MAX_UPLOAD = 50 * 1024 * 1024;
 const IMPORT_CLAUDE = process.env.STM_IMPORT_CLAUDE !== '0';
 const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be open in another terminal
 
@@ -192,6 +194,42 @@ function input(id, data, { user = false } = {}) {
   L.pty.write(data);
   if (user && t.state === 'stm') t.last_focused_at = now(); // the human typing counts as "fresh"; agent/API input doesn't
 }
+
+// Paste text into a tab the way a terminal does: bracketed if the app asked for it (Claude, Codex,
+// and modern shells do), so agents treat a pasted image path as an attachment, not typed keys.
+function pasteInto(id, text) {
+  const L = live.get(id);
+  if (!L || L.exited) return false;
+  const bracketed = L.term.modes && L.term.modes.bracketedPasteMode;
+  L.pty.write(bracketed ? `\x1b[200~${text}\x1b[201~` : text);
+  return true;
+}
+
+function saveUpload(name, buf) {
+  fs.mkdirSync(UPLOADS, { recursive: true });
+  const safe = (path.basename(String(name || 'pasted.png')).replace(/[^\w.-]+/g, '-').replace(/^-+/, '') || 'file').slice(-80);
+  const file = path.join(UPLOADS, `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}-${safe}`);
+  fs.writeFileSync(file, buf);
+  return file;
+}
+
+// Uploads older than a week are pruned at startup; by then the agent has read them.
+function pruneUploads() {
+  try {
+    for (const f of fs.readdirSync(UPLOADS)) {
+      const p = path.join(UPLOADS, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > 7 * 86400e3) fs.rmSync(p, { force: true });
+    }
+  } catch {}
+}
+
+const readRaw = (req) => new Promise((resolve, reject) => {
+  const chunks = [];
+  let n = 0;
+  req.on('data', (c) => { n += c.length; if (n > MAX_UPLOAD) { reject(new Error('file too large (50MB max)')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => resolve(Buffer.concat(chunks)));
+  req.on('error', reject);
+});
 
 const resumeCommand = (t) => (agents[t.kind] && t.agent_session_id ? agents[t.kind].resume(t.agent_session_id) : null);
 
@@ -403,6 +441,17 @@ const server = http.createServer(async (req, res) => {
   }
   if (!p.startsWith('/api/')) return json(res, 404, { error: 'not found' });
   if (req.method !== 'GET' && req.headers['x-stm'] !== '1') return json(res, 403, { error: 'missing x-stm header' });
+  // Raw-body upload: POST /api/upload?name=x.png[&tab=<id>] → saves the file; with tab, pastes its path there.
+  if (p === '/api/upload' && req.method === 'POST') {
+    try {
+      const buf = await readRaw(req);
+      if (!buf.length) return json(res, 400, { error: 'empty body' });
+      const file = saveUpload(url.searchParams.get('name'), buf);
+      const tab = url.searchParams.get('tab');
+      const pasted = tab ? pasteInto(tab, `${file} `) : false;
+      return json(res, 200, { path: file, bytes: buf.length, pasted });
+    } catch (e) { return json(res, 413, { error: String(e.message || e) }); }
+  }
   const body = req.method === 'GET' ? {} : await readBody(req);
   let m;
   try {
@@ -423,6 +472,7 @@ const server = http.createServer(async (req, res) => {
     }
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/focus$/))) return json(res, focus(m[1]) ? 200 : 404, snapshotState());
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/input$/))) { input(m[1], String(body.data || '')); return json(res, 200, { ok: true }); }
+    if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/paste$/))) return json(res, pasteInto(m[1], String(body.text || '')) ? 200 : 404, { ok: true });
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/close$/))) return json(res, closeTab(m[1]) ? 200 : 404, snapshotState());
     if ((m = p.match(/^\/api\/memory\/([\w-]+)\/restore$/))) {
       const r = restore(m[1]);
@@ -502,4 +552,5 @@ server.listen(PORT, '127.0.0.1', () => {
   }
   broadcastState();
   setTimeout(runImport, 200);
+  pruneUploads();
 });

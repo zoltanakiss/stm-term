@@ -12,8 +12,15 @@ npm run daemon     # or just the daemon; open http://127.0.0.1:4790 in any brows
 npm run stop       # stop the daemon (kills tab processes, snapshots everything first)
 npm run qa         # headless QA, isolated daemon, fake tagger (~30s)
 STM_QA_REAL=1 npm run qa      # same, with real Haiku tagging
-node test/claude-tab.mjs      # real Claude tab: task → evict → transcript tags → close → --resume
+node test/electron.mjs        # the real Electron app, hidden window: autostart + Finder-file drop
+node test/claude-tab.mjs      # real Claude tab: task → image drop → evict → tags → close → --resume
 ```
+
+**Images & files:** drag them onto a tab, as in Terminal/iTerm. In the desktop app the real path is pasted,
+backslash-escaped, and as a bracketed paste, so Claude/Codex show `[Image #1]`. `⌘V` with an image on the
+clipboard (e.g. a `⌃⇧⌘4` screenshot) saves it to `~/.stm-term/uploads/` and pastes that path; in a plain
+browser, drops do the same. `Ctrl+V` still goes straight to the agent. Uploads older than 7 days are pruned
+at startup. Agents can do the same with `POST /api/upload?name=x.png&tab=<id>` (raw body).
 
 Keys: `⌘T` shell · `⌘⇧T` Claude · `⌘⌥T` Codex · `⌘W` close · `⌘1–5` switch · `⌘K` search memory.
 

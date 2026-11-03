@@ -130,3 +130,9 @@ kbd { background: var(--panel-2); border: 1px solid var(--border); border-radius
 .mem .more { color: var(--muted); font-size: 11px; line-height: 18px; padding: 0 2px; }
 button.tag-error { background: none; border: 1px dashed var(--warn); border-radius: 10px; padding: 0 7px; line-height: 16px; }
 button.tag-error:hover { background: rgba(224, 164, 88, .12); }
+
+.terms.dropping::after {
+  content: "Drop to attach — the file's path is pasted into this tab"; position: absolute; inset: 8px; z-index: 10;
+  border: 2px dashed var(--accent); border-radius: 10px; background: rgba(138, 180, 248, .08);
+  display: grid; place-items: center; color: var(--accent); font-size: 14px; pointer-events: none;
+}

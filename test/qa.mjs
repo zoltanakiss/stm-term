@@ -9,6 +9,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { solidPng } from './png.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = 4800 + Math.floor(Math.random() * 900);
@@ -249,6 +250,46 @@ async function main() {
   const resumed = await until(async () => (await api('GET', `/api/tabs/${cxTab.id}/text`)).text.includes(`FAKE-CODEX args: resume ${FAKE_CODEX_SID} --dangerously-bypass-approvals-and-sandbox`), 10000);
   check('restored Codex tab runs `codex resume <same id>` with bypass flags', !!resumed);
   await page.screenshot({ path: path.join(ART, '06-codex.png') });
+
+  // 10. Images: drag & drop and ⌘V paste. In a plain browser there are no file paths, so bytes are
+  //     uploaded to the daemon and the saved path is pasted, bracketed when the app enabled it.
+  const png = solidPng();
+  await page.click('[data-testid=new-shell]');
+  const imgTab = await until(async () => { const s = await api('GET', '/api/state'); const t = s.stm.find((x) => x.kind === 'shell' && x.process === 'running' && x.id === s.focusedId); return t; });
+  await api('POST', `/api/tabs/${imgTab.id}/input`, { data: "printf '\\033[?2004h'; cat -v\n" }); // app enables bracketed paste, shows raw bytes
+  await sleep(700);
+  const b64 = png.toString('base64');
+  await page.evaluate(([b64, id]) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], 'Screenshot 2026-11-02 at 7.22.50 PM.png', { type: 'image/png' }));
+    const el = document.querySelector(`.term[data-tab-id="${id}"] .xterm-screen`);
+    for (const type of ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, [b64, imgTab.id]);
+  const dropped = await until(async () => {
+    const m = (await api('GET', `/api/tabs/${imgTab.id}/text`)).text.replace(/\n/g, '').match(/\^\[\[200~(\S+uploads\/\S+\.png) \^\[\[201~/);
+    return m && m[1];
+  }, 6000);
+  check('drag & drop image → saved + path pasted (bracketed)', !!dropped && fs.existsSync(dropped) && fs.readFileSync(dropped).equals(png), dropped || 'no path in tab');
+  check('page did not navigate away on drop', page.url().startsWith(BASE));
+  await page.evaluate(([b64, id]) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], 'image.png', { type: 'image/png' }));
+    const ta = document.querySelector(`.term[data-tab-id="${id}"] .xterm-helper-textarea`);
+    ta.focus();
+    ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+  }, [b64, imgTab.id]);
+  const pasted = await until(async () => {
+    const all = [...(await api('GET', `/api/tabs/${imgTab.id}/text`)).text.replace(/\n/g, '').matchAll(/\^\[\[200~(\S+uploads\/\S+-image\.png) \^\[\[201~/g)];
+    return all.length ? all[all.length - 1][1] : null;
+  }, 6000);
+  check('⌘V with an image on the clipboard → saved + path pasted', !!pasted && fs.readFileSync(pasted).equals(png), pasted || 'no path');
+  const up = await fetch(`${BASE}/api/upload?name=api.png&tab=${imgTab.id}`, { method: 'POST', headers: { 'x-stm': '1' }, body: png }).then((r) => r.json());
+  check('API upload with tab= pastes into the tab (agent parity)', up.pasted && await until(async () => (await api('GET', `/api/tabs/${imgTab.id}/text`)).text.replace(/\n/g, '').includes(up.path), 4000));
+  const tooBig = await fetch(`${BASE}/api/upload?name=x.bin`, { method: 'POST', headers: { 'x-stm': '1' } , body: Buffer.alloc(0) });
+  check('empty upload rejected', tooBig.status === 400);
+  await page.screenshot({ path: path.join(ART, '07-image-drop.png') });
 
   // 8. Security: cross-site mutation without the header is refused; foreign Host is refused.
   const noHeader = await fetch(`${BASE}/api/tabs`, { method: 'POST', body: '{}' });
