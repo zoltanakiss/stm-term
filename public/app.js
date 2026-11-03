@@ -1,0 +1,223 @@
+/* global Terminal, FitAddon */
+'use strict';
+const $ = (s) => document.querySelector(s);
+const H = { 'content-type': 'application/json', 'x-stm': '1' };
+const api = (method, url, body) => fetch(url, { method, headers: H, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json());
+
+let S = null; // last state from daemon
+let ws = null;
+let memVersion = -1;
+let query = '';
+let tagFilter = null;
+const terms = new Map(); // id -> { term, fit, el }
+
+const send = (m) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const home = (p) => String(p || '').replace(/^\/Users\/[^/]+/, '~');
+
+function rel(ts) {
+  if (!ts) return '';
+  const s = (Date.now() - ts) / 1000;
+  if (s < 45) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} hr ago`;
+  const d = Math.round(s / 86400);
+  return d === 1 ? '1 day ago' : `${d} days ago`;
+}
+function dayLabel(ts) {
+  const d = new Date(ts); const t = new Date();
+  const y = new Date(); y.setDate(t.getDate() - 1);
+  const same = (a, b) => a.toDateString() === b.toDateString();
+  const fmt = d.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+  return same(d, t) ? `Today · ${fmt}` : same(d, y) ? `Yesterday · ${fmt}` : fmt;
+}
+
+// ---------- connection ----------
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { for (const id of terms.keys()) attach(id); };
+  ws.onclose = () => setTimeout(connect, 800);
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'state') applyState(m.state);
+    else if (m.type === 'snapshot') { const T = terms.get(m.id); if (T) { T.term.reset(); T.term.write(m.data); } }
+    else if (m.type === 'data') { const T = terms.get(m.id); if (T) T.term.write(m.data); }
+  };
+}
+
+// ---------- short-term memory ----------
+function ensureTerm(id) {
+  if (terms.has(id)) return terms.get(id);
+  const el = document.createElement('div');
+  el.className = 'term';
+  el.dataset.tabId = id;
+  el.dataset.testid = 'terminal';
+  $('#terms').append(el);
+  const term = new Terminal({
+    fontFamily: 'Menlo, "SF Mono", ui-monospace, monospace', fontSize: 13, cursorBlink: true,
+    macOptionIsMeta: true, allowProposedApi: true, scrollback: 5000,
+    theme: { background: '#16171d', foreground: '#e3e5ea', cursor: '#8ab4f8', selectionBackground: '#3a4660' },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(el);
+  try { fit.fit(); } catch {}
+  term.onData((d) => send({ type: 'input', id, data: d }));
+  term.onResize(({ cols, rows }) => send({ type: 'resize', id, cols, rows }));
+  term.attachCustomKeyEventHandler((e) => !(e.metaKey && /^[tTwkK1-5]$/.test(e.key)));
+  const T = { term, fit, el };
+  terms.set(id, T);
+  attach(id);
+  return T;
+}
+function attach(id) {
+  const T = terms.get(id);
+  if (!T) return;
+  send({ type: 'attach', id, cols: T.term.cols, rows: T.term.rows });
+}
+function dropTerm(id) {
+  const T = terms.get(id);
+  if (!T) return;
+  send({ type: 'detach', id });
+  T.term.dispose();
+  T.el.remove();
+  terms.delete(id);
+}
+
+let shownId = null;
+function show(id) {
+  for (const [tid, T] of terms) T.el.classList.toggle('active', tid === id);
+  const T = terms.get(id);
+  if (T) {
+    try { T.fit.fit(); } catch {}
+    if (shownId !== id || document.activeElement === document.body) T.term.focus();
+  }
+  shownId = id;
+  $('#empty').hidden = !!id;
+}
+
+function applyState(s) {
+  S = s;
+  const ids = new Set(s.stm.map((t) => t.id));
+  for (const id of [...terms.keys()]) if (!ids.has(id)) dropTerm(id);
+  for (const t of s.stm) ensureTerm(t.id);
+  renderTabs();
+  show(s.focusedId);
+  if (s.memVersion !== memVersion) { memVersion = s.memVersion; loadMemory(); }
+  $('#ltm-count').textContent = s.ltmCount;
+}
+
+function renderTabs() {
+  $('#tabs').innerHTML = S.stm.map((t, i) => `
+    <div class="tab ${t.kind === 'claude' ? 'claude' : ''}" role="tab" tabindex="0" data-testid="stm-tab" data-id="${t.id}"
+      aria-selected="${t.id === S.focusedId}" title="${esc(t.title)} — ${esc(home(t.cwd))}  (⌘${i + 1})">
+      <span class="k">${t.kind === 'claude' ? '✳' : '&gt;_'}</span>
+      <span class="n">${esc(t.title)}</span>
+      ${t.process === 'exited' ? '<span class="dead" title="process exited">●</span>' : ''}
+      ${t.id === S.nextToEvict ? '<span class="evict" data-testid="next-evict" title="Stalest tab: opening another moves it to long-term memory">next out</span>' : ''}
+      <span class="x" data-close="${t.id}" data-testid="close-tab" title="Close (⌘W): archive and stop process">×</span>
+    </div>`).join('');
+  $('#slots').innerHTML = Array.from({ length: S.max }, (_, i) => `<i class="${i < S.stm.length ? 'on' : ''}"></i>`).join('');
+  $('#slots').title = `${S.stm.length} / ${S.max} short-term slots`;
+}
+
+function focusTab(id) {
+  if (!id) return;
+  S.focusedId = id;
+  renderTabs();
+  show(id);
+  send({ type: 'focus', id });
+}
+
+$('#tabs').addEventListener('click', (e) => {
+  const close = e.target.closest('[data-close]');
+  if (close) { api('POST', `/api/tabs/${close.dataset.close}/close`); return; }
+  const tab = e.target.closest('.tab');
+  if (tab) focusTab(tab.dataset.id);
+});
+$('#new-shell').onclick = () => newTab(false);
+$('#new-claude').onclick = () => newTab(true);
+function newTab(claude) {
+  const cur = S && S.stm.find((t) => t.id === S.focusedId);
+  api('POST', '/api/tabs', { claude, cwd: cur ? cur.cwd : undefined });
+}
+
+// ---------- long-term memory ----------
+async function loadMemory() {
+  const qs = new URLSearchParams();
+  if (query) qs.set('q', query);
+  if (tagFilter) qs.set('tag', tagFilter);
+  const { items, tagCounts } = await api('GET', `/api/memory?${qs}`);
+  renderMemory(items, tagCounts);
+}
+
+function renderMemory(items, tagCounts) {
+  $('#filter').hidden = !tagFilter;
+  $('#filter-chip').textContent = tagFilter || '';
+  const top = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).slice(0, 12);
+  $('#top-tags').innerHTML = tagFilter ? '' : top.map(([t, n]) => `<button class="tag" data-tag="${esc(t)}" title="${n} tab(s)">${esc(t)}</button>`).join('');
+  if (!items.length) {
+    $('#ltm-list').innerHTML = `<div class="ltm-empty">${query || tagFilter ? 'Nothing in memory matches.' : 'Nothing here yet. When you open a 6th tab, the stalest one moves here.'}</div>`;
+    return;
+  }
+  let html = '';
+  let lastDay = '';
+  for (const t of items) {
+    const ts = t.last_active_at || t.evicted_at;
+    const day = dayLabel(ts);
+    if (day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
+    const tags = t.tag_status === 'pending'
+      ? '<span class="tagging" data-testid="tagging">tagging…</span>'
+      : t.tags.map((g) => `<button class="tag ${g === tagFilter ? 'active' : ''}" data-tag="${esc(g)}" data-testid="mem-tag">${esc(g)}</button>`).join('')
+        + (t.tag_status === 'error' ? '<span class="tag-error">tagging failed</span>' : '');
+    html += `
+      <div class="mem ${t.kind === 'claude' ? 'claude' : ''}" role="listitem" data-testid="memory-item" data-id="${t.id}" title="Click to bring back into short-term memory">
+        <div class="icon">${t.kind === 'claude' ? '✳' : '&gt;_'}</div>
+        <div>
+          <div class="t">${esc(t.title)}</div>
+          ${t.summary ? `<div class="s">${esc(t.summary)}</div>` : ''}
+          <div class="p">${esc(home(t.cwd))}</div>
+          <div class="tags">${tags}</div>
+        </div>
+        <div class="right">
+          <span class="time" title="${esc(new Date(ts).toLocaleString())}">${rel(ts)}</span>
+          <span class="status ${t.process}" title="${t.process === 'running' ? 'process still running in the background' : 'saved snapshot; a new shell starts on restore'}">${t.process === 'running' ? '● live' : 'snapshot'}</span>
+          <button class="forget" data-forget="${t.id}" title="Forget permanently" data-testid="forget">×</button>
+        </div>
+      </div>`;
+  }
+  $('#ltm-list').innerHTML = html;
+}
+
+function setTag(tag) {
+  tagFilter = tagFilter === tag ? null : tag;
+  loadMemory();
+}
+$('#ltm').addEventListener('click', (e) => {
+  const tagBtn = e.target.closest('[data-tag]');
+  if (tagBtn) { e.stopPropagation(); setTag(tagBtn.dataset.tag); return; }
+  if (e.target.closest('#filter-chip')) { setTag(tagFilter); return; }
+  const forget = e.target.closest('[data-forget]');
+  if (forget) { api('DELETE', `/api/memory/${forget.dataset.forget}`); return; }
+  const item = e.target.closest('.mem');
+  if (item) api('POST', `/api/memory/${item.dataset.id}/restore`);
+});
+let searchTimer;
+$('#search').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { query = e.target.value; loadMemory(); }, 120);
+});
+
+// ---------- keys ----------
+document.addEventListener('keydown', (e) => {
+  if (!e.metaKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 't') { e.preventDefault(); newTab(e.shiftKey); }
+  else if (k === 'w' && S && S.focusedId) { e.preventDefault(); api('POST', `/api/tabs/${S.focusedId}/close`); }
+  else if (k === 'k') { e.preventDefault(); $('#search').focus(); $('#search').select(); }
+  else if (/^[1-5]$/.test(k) && S && S.stm[+k - 1]) { e.preventDefault(); focusTab(S.stm[+k - 1].id); }
+}, true);
+
+window.addEventListener('resize', () => { if (shownId && terms.get(shownId)) terms.get(shownId).fit.fit(); });
+setInterval(() => { if (memVersion >= 0) loadMemory(); }, 60000); // keep "N min ago" fresh
+connect();

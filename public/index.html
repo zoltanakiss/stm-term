@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STM Term</title>
+  <link rel="stylesheet" href="/vendor/xterm.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <aside id="ltm" aria-label="Long-term memory">
+    <header class="ltm-head">
+      <div class="ltm-title">Long-term memory <span id="ltm-count" data-testid="ltm-count">0</span></div>
+      <label class="search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4a6 6 0 1 0 3.7 10.7l4.8 4.8 1.4-1.4-4.8-4.8A6 6 0 0 0 10 4zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8z"/></svg>
+        <input id="search" data-testid="ltm-search" type="search" placeholder="Search memory  (⌘K)" autocomplete="off" spellcheck="false">
+      </label>
+      <div id="filter" class="filter" hidden>
+        <span>tag</span><button id="filter-chip" class="tag active" data-testid="tag-filter"></button>
+      </div>
+      <div id="top-tags" class="top-tags" data-testid="top-tags"></div>
+    </header>
+    <div id="ltm-list" class="ltm-list" data-testid="ltm-list" role="list"></div>
+  </aside>
+  <main>
+    <nav id="tabbar" aria-label="Short-term memory">
+      <div id="tabs" class="tabs" role="tablist" data-testid="stm-tabs"></div>
+      <div class="tab-actions">
+        <span id="slots" class="slots" data-testid="stm-slots" title="Short-term memory slots"></span>
+        <button id="new-shell" data-testid="new-shell" title="New shell (⌘T)">+ Shell</button>
+        <button id="new-claude" data-testid="new-claude" title="New Claude Code (⌘⇧T)">+ Claude</button>
+      </div>
+    </nav>
+    <section id="terms" class="terms">
+      <div id="empty" class="empty" hidden>
+        <p>Short-term memory is empty.</p>
+        <p><kbd>⌘T</kbd> shell · <kbd>⌘⇧T</kbd> Claude · or pick something from long-term memory.</p>
+      </div>
+    </section>
+  </main>
+  <script src="/vendor/xterm.js"></script>
+  <script src="/vendor/addon-fit.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
