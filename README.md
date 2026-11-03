@@ -7,12 +7,22 @@ and pushes the next-stalest tab out.
 
 ```bash
 npm install
+node node_modules/electron/install.js   # npm's allow-scripts gate skips Electron's binary download
+npx playwright install chromium-headless-shell   # only for `npm run qa`
 npm run app        # Electron window (starts the daemon if it isn't running)
 npm run daemon     # or just the daemon; open http://127.0.0.1:4790 in any browser
 npm run stop       # stop the daemon (kills tab processes, snapshots everything first)
 npm run qa         # headless QA, isolated daemon, fake tagger (~30s)
 STM_QA_REAL=1 npm run qa      # same, with real Haiku tagging
 node test/claude-tab.mjs      # real Claude tab: task → evict → transcript tags → close → --resume
+```
+
+New tabs start in the focused tab's directory. With no tab focused they start in `STM_DEFAULT_CWD`,
+else `"defaultCwd"` in `~/.stm-term/config.json` (`~` is expanded), else your home directory. Use the
+config file if you launch from Finder or the Dock, since those don't pass environment variables:
+
+```bash
+echo '{ "defaultCwd": "~/code/main-repo" }' > ~/.stm-term/config.json   # then restart the daemon
 ```
 
 Keys: `⌘T` shell · `⌘⇧T` Claude · `⌘W` close · `⌘1–5` switch · `⌘K` search memory.
@@ -82,11 +92,13 @@ Every UI action has an API twin, so an agent can check state as data and use pix
 | `POST /api/tabs/:id/focus` · `/close` | |
 | `POST /api/memory/:id/restore` · `/retag` · `DELETE /api/memory/:id` | |
 
-Mutations need the `x-stm: 1` header. For free-form exploring, start an isolated daemon
+Mutations need the `x-stm: 1` header. `GET /api/health` reports the default cwd in use.
+An agent that starts the daemon with `cmd &` from zsh gets `BG_NICE`: the daemon and every tab run at nice +5.
+Start it from bash, or with `setopt no_bg_nice`. For free-form exploring, start an isolated daemon
 (`STM_PORT=4811 STM_DATA_DIR=$(mktemp -d) STM_TAGGER=fake npm run daemon`) and point a headless browser
 (Playwright MCP, or a script) at it. Never QA against `~/.stm-term`: that's the user's real memory.
 UI hooks use `data-testid`: `stm-tab`, `next-evict`, `new-shell`, `new-claude`, `close-tab`,
 `ltm-search`, `memory-item`, `mem-tag`, `tag-filter`, `forget`.
 
-Env: `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_MAX` (5) · `STM_TAGGER` (claude|api|fake) ·
+Env: `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_DEFAULT_CWD` (~) · `STM_MAX` (5) · `STM_TAGGER` (claude|api|fake) ·
 `STM_CLAUDE_CMD` · `STM_SHELL`.

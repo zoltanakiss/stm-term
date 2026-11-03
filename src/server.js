@@ -24,9 +24,21 @@ const CLAUDE_CMD = process.env.STM_CLAUDE_CMD || 'claude --chrome --dangerously-
 const ROOT = path.join(__dirname, '..');
 const IMPORT_CLAUDE = process.env.STM_IMPORT_CLAUDE !== '0';
 const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be open in another terminal
+// Where a tab starts when there is no focused tab to inherit from: STM_DEFAULT_CWD, else
+// "defaultCwd" in <data dir>/config.json (read at startup, so a Finder-launched app gets it too), else ~.
+const expandHome = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
+function readDefaultCwd() {
+  let cfg = {};
+  try { cfg = JSON.parse(fs.readFileSync(path.join(DATA, 'config.json'), 'utf8')); } catch {}
+  const want = expandHome(process.env.STM_DEFAULT_CWD || cfg.defaultCwd);
+  if (want && fs.existsSync(want)) return want;
+  if (want) console.warn(`stm-term: default cwd ${want} does not exist; using ~`);
+  return os.homedir();
+}
 
 fs.mkdirSync(DATA, { recursive: true });
 const db = openDb(path.join(DATA, 'stm.sqlite'));
+const DEFAULT_CWD = readDefaultCwd();
 const tabs = new Map(db.all().map((t) => [t.id, t]));
 const live = new Map(); // id -> { pty, term, ser, exited }
 const clients = new Set();
@@ -88,16 +100,19 @@ function childEnv(id) {
 
 function plainText(term, lines = 400) {
   const buf = term.buffer.active;
+  // Count back from the last non-blank row, not from the bottom of the buffer: after `clear`
+  // the output sits at the top of the screen and the bottom rows are all blank.
+  let end = buf.length;
+  while (end > 0 && !buf.getLine(end - 1).translateToString(true).trim()) end--;
   const out = [];
-  for (let i = Math.max(0, buf.length - lines); i < buf.length; i++) out.push(buf.getLine(i).translateToString(true));
-  while (out.length && !out[out.length - 1].trim()) out.pop();
+  for (let i = Math.max(0, end - lines); i < end; i++) out.push(buf.getLine(i).translateToString(true));
   return out.join('\n');
 }
 
 function spawnLive(t, { replay = false, command = null } = {}) {
   const cols = t.cols || 120;
   const rows = t.rows || 32;
-  const cwd = t.cwd && fs.existsSync(t.cwd) ? t.cwd : os.homedir();
+  const cwd = t.cwd && fs.existsSync(t.cwd) ? t.cwd : DEFAULT_CWD;
   const term = new Terminal({ cols, rows, scrollback: 5000, allowProposedApi: true });
   const ser = new SerializeAddon();
   term.loadAddon(ser);
@@ -186,7 +201,7 @@ const resumeCommand = (t) => (t.kind === 'claude' && t.claude_session_id ? `${CL
 function createTab({ cwd, claude = false, command = null } = {}) {
   const id = crypto.randomUUID();
   const t = {
-    id, title: '', osc_title: '', cwd: cwd || os.homedir(), state: 'stm', kind: claude ? 'claude' : 'shell',
+    id, title: '', osc_title: '', cwd: cwd || DEFAULT_CWD, state: 'stm', kind: claude ? 'claude' : 'shell',
     position: nextPosition(), created_at: now(), last_focused_at: now(), last_active_at: now(),
     tags: [], summary: '', tag_status: 'none', claude_session_id: null, command,
   };
@@ -394,7 +409,7 @@ const server = http.createServer(async (req, res) => {
   const body = req.method === 'GET' ? {} : await readBody(req);
   let m;
   try {
-    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX });
+    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX, defaultCwd: DEFAULT_CWD });
     if (p === '/api/state') return json(res, 200, snapshotState());
     if (p === '/api/memory' && req.method === 'GET') return json(res, 200, searchMemory(url.searchParams.get('q'), url.searchParams.get('tag')));
     if (p === '/api/tabs' && req.method === 'POST') return json(res, 200, publicTab(createTab(body)));
@@ -478,7 +493,7 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`stm-term daemon on http://127.0.0.1:${PORT}  data=${DATA}  max=${MAX}`);
+  console.log(`stm-term daemon on http://127.0.0.1:${PORT}  data=${DATA}  max=${MAX}  cwd=${DEFAULT_CWD}`);
   // Tabs that were open when the daemon last stopped come back as snapshots with fresh shells.
   for (const t of stmTabs()) if (!live.has(t.id)) spawnLive(t, { replay: true, command: resumeCommand(t) });
   // Drop tags we no longer emit (e.g. claude-code) from older rows.
