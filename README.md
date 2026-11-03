@@ -42,6 +42,14 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
 - **Claude tabs** started from `+ Claude` run `claude --chrome --dangerously-skip-permissions --session-id <uuid>`,
   so the session id is known exactly. A `claude` you start by hand in a shell tab is detected from the
   process tree, and its newest transcript is found under `~/.claude/projects/<cwd-slug>/`.
+- **Your existing Claude Code sessions are imported** from `~/.claude/projects/*/*.jsonl` at startup
+  and every 60s. Only interactive sessions (`entrypoint: "cli"`) with at least one human message are
+  imported; SDK and background sessions (claude-mem observers, `claude -p`) and sessions in temp dirs
+  are skipped. Claude's own `ai-title` is kept as the title, and the transcript becomes searchable. Haiku
+  tags them in the background, newest first, 2 at a time. A session touched in the last 10 minutes shows
+  "active elsewhere" (it may be open in another terminal) and is re-tagged only once it goes quiet.
+  Forgetting an imported session leaves a tombstone, so the importer doesn't bring it back.
+  Disable with `STM_IMPORT_CLAUDE=0`.
 - **Tagging input:** title, cwd, git repo and branch, child processes, the last ~120 lines of output and,
   for Claude tabs, the transcript (first ask plus recent turns). Tags are re-generated on every eviction.
 - **Tagger runs `claude -p --setting-sources project` from an empty temp dir.** That way your user
