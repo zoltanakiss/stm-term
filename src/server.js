@@ -15,13 +15,16 @@ const procinfo = require('./procinfo');
 const tagger = require('./tagger');
 const { cleanEnv } = require('./env');
 const importer = require('./importer');
+const { agents } = require('./agents');
 
 const PORT = +(process.env.STM_PORT || 4790);
 const DATA = process.env.STM_DATA_DIR || path.join(os.homedir(), '.stm-term');
 const MAX = +(process.env.STM_MAX || 5);
 const SHELL = process.env.STM_SHELL || process.env.SHELL || '/bin/zsh';
-const CLAUDE_CMD = process.env.STM_CLAUDE_CMD || 'claude --chrome --dangerously-skip-permissions';
 const ROOT = path.join(__dirname, '..');
+const SESSIONS_DIR = path.join(DATA, 'agent-sessions'); // SessionStart hook records, keyed by tab id
+const UPLOADS = path.join(DATA, 'uploads'); // dropped / pasted files, so their paths can be pasted into a tab
+const MAX_UPLOAD = 50 * 1024 * 1024;
 const IMPORT_CLAUDE = process.env.STM_IMPORT_CLAUDE !== '0';
 const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be open in another terminal
 // Where a tab starts when there is no focused tab to inherit from: STM_DEFAULT_CWD, else
@@ -40,6 +43,7 @@ fs.mkdirSync(DATA, { recursive: true });
 const db = openDb(path.join(DATA, 'stm.sqlite'));
 const DEFAULT_CWD = readDefaultCwd();
 const tabs = new Map(db.all().map((t) => [t.id, t]));
+for (const t of tabs.values()) t.agent_session_id = t.agent_session_id || t.claude_session_id || null;
 const live = new Map(); // id -> { pty, term, ser, exited }
 const clients = new Set();
 let memVersion = 0;
@@ -57,9 +61,9 @@ function publicTab(t) {
     id: t.id, title: displayTitle(t), osc_title: t.osc_title, ai_title: t.title, cwd: t.cwd, state: t.state,
     kind: t.kind, position: t.position, created_at: t.created_at, last_focused_at: t.last_focused_at,
     last_active_at: t.last_active_at, evicted_at: t.evicted_at, tags: t.tags || [], summary: t.summary,
-    tag_status: t.tag_status, claude_session_id: t.claude_session_id, import_source: t.import_source || null,
+    tag_status: t.tag_status, agent_session_id: t.agent_session_id, import_source: t.import_source || null,
     process: L ? (L.exited ? 'exited' : 'running') : 'snapshot',
-    active_elsewhere: !L && t.import_source === 'claude' && now() - (t.last_active_at || 0) < ACTIVE_WINDOW,
+    active_elsewhere: !L && !!t.import_source && now() - (t.last_active_at || 0) < ACTIVE_WINDOW,
   };
 }
 function snapshotState() {
@@ -95,6 +99,7 @@ function childEnv(id) {
   const env = cleanEnv({ TERM_PROGRAM: 'stm-term', COLORTERM: 'truecolor' });
   for (const k of Object.keys(env)) if (k.startsWith('STM_')) delete env[k];
   env.STM_TAB_ID = id;
+  env.STM_SESSIONS_DIR = SESSIONS_DIR;
   return env;
 }
 
@@ -150,6 +155,16 @@ function persistSnapshot(t) {
   save(t);
 }
 
+function refreshAgentSession(t) {
+  const loc = agents.codex.locate({ tabId: t.id, sessionsDir: SESSIONS_DIR });
+  if (!loc || (t.kind === 'codex' && t.agent_session_id === loc.sessionId)) return;
+  if (t.kind === 'shell' || t.kind === 'codex') {
+    Object.assign(t, { kind: 'codex', agent_session_id: loc.sessionId });
+    save(t);
+    broadcastState();
+  }
+}
+
 async function refreshCwd(t) {
   const L = live.get(t.id);
   if (!L || L.exited) return;
@@ -195,20 +210,55 @@ function input(id, data, { user = false } = {}) {
   if (user && t.state === 'stm') t.last_focused_at = now(); // the human typing counts as "fresh"; agent/API input doesn't
 }
 
-const resumeCommand = (t) => (t.kind === 'claude' && t.claude_session_id ? `${CLAUDE_CMD} --resume ${t.claude_session_id}` : null);
+// Paste text into a tab the way a terminal does: bracketed if the app asked for it (Claude, Codex,
+// and modern shells do), so agents treat a pasted image path as an attachment, not typed keys.
+function pasteInto(id, text) {
+  const L = live.get(id);
+  if (!L || L.exited) return false;
+  const bracketed = L.term.modes && L.term.modes.bracketedPasteMode;
+  L.pty.write(bracketed ? `\x1b[200~${text}\x1b[201~` : text);
+  return true;
+}
+
+function saveUpload(name, buf) {
+  fs.mkdirSync(UPLOADS, { recursive: true });
+  const safe = (path.basename(String(name || 'pasted.png')).replace(/[^\w.-]+/g, '-').replace(/^-+/, '') || 'file').slice(-80);
+  const file = path.join(UPLOADS, `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}-${safe}`);
+  fs.writeFileSync(file, buf);
+  return file;
+}
+
+// Uploads older than a week are pruned at startup; by then the agent has read them.
+function pruneUploads() {
+  try {
+    for (const f of fs.readdirSync(UPLOADS)) {
+      const p = path.join(UPLOADS, f);
+      if (Date.now() - fs.statSync(p).mtimeMs > 7 * 86400e3) fs.rmSync(p, { force: true });
+    }
+  } catch {}
+}
+
+const readRaw = (req) => new Promise((resolve, reject) => {
+  const chunks = [];
+  let n = 0;
+  req.on('data', (c) => { n += c.length; if (n > MAX_UPLOAD) { reject(new Error('file too large (50MB max)')); req.destroy(); } else chunks.push(c); });
+  req.on('end', () => resolve(Buffer.concat(chunks)));
+  req.on('error', reject);
+});
+
+const resumeCommand = (t) => (agents[t.kind] && t.agent_session_id ? agents[t.kind].resume(t.agent_session_id) : null);
 
 // ---------- memory rules ----------
-function createTab({ cwd, claude = false, command = null } = {}) {
+function createTab({ cwd, agent = null, claude = false, command = null } = {}) {
+  agent = agent || (claude ? 'claude' : null);
+  if (agent && !agents[agent]) throw new Error(`unknown agent ${agent}`);
   const id = crypto.randomUUID();
   const t = {
-    id, title: '', osc_title: '', cwd: cwd || DEFAULT_CWD, state: 'stm', kind: claude ? 'claude' : 'shell',
+    id, title: '', osc_title: '', cwd: cwd || DEFAULT_CWD, state: 'stm', kind: agent || 'shell',
     position: nextPosition(), created_at: now(), last_focused_at: now(), last_active_at: now(),
-    tags: [], summary: '', tag_status: 'none', claude_session_id: null, command,
+    tags: [], summary: '', tag_status: 'none', agent_session_id: null, command,
   };
-  if (claude) {
-    t.claude_session_id = crypto.randomUUID();
-    t.command = `${CLAUDE_CMD} --session-id ${t.claude_session_id}`;
-  }
+  if (agent) t.command = agents[agent].launch(t);
   tabs.set(id, t);
   save(t);
   spawnLive(t, { command: t.command });
@@ -254,14 +304,14 @@ function archive(t, { kill }) {
 async function tagTab(t, L) {
   try {
     const pid = L && !L.exited ? L.pty.pid : null;
-    const info = await procinfo.inspect(pid, t.claude_session_id, t.cwd);
+    const info = await procinfo.inspect(pid, t, SESSIONS_DIR);
     if (info.cwd) t.cwd = info.cwd;
-    if (info.claude) { t.kind = 'claude'; t.claude_session_id = info.claude.sessionId || t.claude_session_id; }
+    if (info.agent) { t.kind = info.agent.kind; t.agent_session_id = info.agent.sessionId || t.agent_session_id; }
     const out = await tagger.tag({
       title: t.osc_title || displayTitle(t), cwd: t.cwd, git: info.git, processes: info.processes,
-      claude: info.claude, scrollback: t.scrollback, previousTags: t.tags,
+      agent: info.agent, scrollback: t.scrollback, previousTags: t.tags,
     });
-    const keepTitle = t.import_source === 'claude' && t.osc_title; // Claude's own ai-title beats ours
+    const keepTitle = t.import_source && t.osc_title; // the agent's own session title beats ours
     Object.assign(t, { title: keepTitle ? t.osc_title : (out.title || t.title), tags: out.tags, summary: out.summary, tag_status: 'done' });
   } catch (e) {
     t.tag_status = 'error';
@@ -293,16 +343,16 @@ function pumpTags() {
 const importHooks = {
   create(fields) {
     const t = {
-      id: crypto.randomUUID(), state: 'ltm', kind: 'claude', import_source: 'claude', position: 0,
+      id: crypto.randomUUID(), state: 'ltm', position: 0,
       last_focused_at: 0, evicted_at: fields.last_active_at, tags: [], summary: '', tag_status: 'queued',
-      ...fields, osc_title: fields.title,
+      ...fields, osc_title: fields.native_title || '',
     };
     tabs.set(t.id, t);
     save(t);
     queueTag(t);
   },
   update(t, fields) {
-    Object.assign(t, fields, { osc_title: fields.title, evicted_at: fields.last_active_at });
+    Object.assign(t, fields, { osc_title: fields.native_title || t.osc_title || '', evicted_at: fields.last_active_at });
     // Still being worked on elsewhere: mark stale and re-tag once it settles, not every minute.
     t.tag_status = now() - fields.last_active_at < ACTIVE_WINDOW ? 'stale' : 'queued';
     save(t);
@@ -346,7 +396,7 @@ function forget(id) {
   const L = live.get(id);
   if (L && !L.exited) L.pty.kill();
   live.delete(id);
-  if (t.claude_session_id) {
+  if (t.agent_session_id) {
     // Tombstone, so the Claude-session importer doesn't bring it back on the next scan.
     Object.assign(t, { state: 'forgotten', snapshot: null, scrollback: '', tags: [], summary: '' });
     save(t);
@@ -406,6 +456,17 @@ const server = http.createServer(async (req, res) => {
   }
   if (!p.startsWith('/api/')) return json(res, 404, { error: 'not found' });
   if (req.method !== 'GET' && req.headers['x-stm'] !== '1') return json(res, 403, { error: 'missing x-stm header' });
+  // Raw-body upload: POST /api/upload?name=x.png[&tab=<id>] → saves the file; with tab, pastes its path there.
+  if (p === '/api/upload' && req.method === 'POST') {
+    try {
+      const buf = await readRaw(req);
+      if (!buf.length) return json(res, 400, { error: 'empty body' });
+      const file = saveUpload(url.searchParams.get('name'), buf);
+      const tab = url.searchParams.get('tab');
+      const pasted = tab ? pasteInto(tab, `${file} `) : false;
+      return json(res, 200, { path: file, bytes: buf.length, pasted });
+    } catch (e) { return json(res, 413, { error: String(e.message || e) }); }
+  }
   const body = req.method === 'GET' ? {} : await readBody(req);
   let m;
   try {
@@ -426,6 +487,7 @@ const server = http.createServer(async (req, res) => {
     }
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/focus$/))) return json(res, focus(m[1]) ? 200 : 404, snapshotState());
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/input$/))) { input(m[1], String(body.data || '')); return json(res, 200, { ok: true }); }
+    if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/paste$/))) return json(res, pasteInto(m[1], String(body.text || '')) ? 200 : 404, { ok: true });
     if ((m = p.match(/^\/api\/tabs\/([\w-]+)\/close$/))) return json(res, closeTab(m[1]) ? 200 : 404, snapshotState());
     if ((m = p.match(/^\/api\/memory\/([\w-]+)\/restore$/))) {
       const r = restore(m[1]);
@@ -474,7 +536,7 @@ server.on('upgrade', (req, socket, head) => {
 // ---------- lifecycle ----------
 // Periodic snapshot + title/cwd refresh so a crash loses little and the tab bar stays accurate.
 setInterval(() => {
-  for (const t of stmTabs()) refreshCwd(t);
+  for (const t of stmTabs()) { refreshCwd(t); refreshAgentSession(t); }
 }, 3000).unref();
 setInterval(runImport, 60000).unref();
 setInterval(() => {
@@ -499,7 +561,11 @@ server.listen(PORT, '127.0.0.1', () => {
   // Drop tags we no longer emit (e.g. claude-code) from older rows.
   for (const t of tabs.values()) if ((t.tags || []).some((g) => tagger.NOISE.has(g))) { t.tags = t.tags.filter((g) => !tagger.NOISE.has(g)); save(t); }
   // Tagging interrupted by a previous shutdown resumes now.
-  for (const t of tabs.values()) if (t.state === 'ltm' && (t.tag_status === 'queued' || t.tag_status === 'pending')) queueTag(t);
+  for (const t of tabs.values()) if (t.state === 'ltm' && ['queued', 'pending', 'error'].includes(t.tag_status)) queueTag(t);
+  if (process.env.STM_INSTALL_CODEX_HOOK !== '0') {
+    try { console.log(`[codex] SessionStart hook: ${agents.codex.ensureHook()}`); } catch (e) { console.error('[codex] hook install failed', e.message); }
+  }
   broadcastState();
   setTimeout(runImport, 200);
+  pruneUploads();
 });

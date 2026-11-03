@@ -10,7 +10,8 @@
   --accent-bg: rgba(138, 180, 248, 0.14);
   --claude: #d97757;
   --warn: #e0a458;
-  --sidebar: 340px;
+  --sidebar: 300px;
+  --codex: #7fcfc4;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -113,3 +114,25 @@ kbd { background: var(--panel-2); border: 1px solid var(--border); border-radius
 .mem > div:nth-child(2) { min-width: 0; }
 .ltm-list { overflow-x: hidden; }
 .mem .status.elsewhere { color: var(--warn); }
+
+/* ---- v3: agents + compact tab bar ---- */
+.tab.codex .k, .mem.codex .icon { color: var(--codex); font-size: 14px; }
+.mem.claude .icon { color: var(--claude); font-size: 15px; }
+#new-codex { color: var(--codex); }
+.tab-actions button b { font-weight: 600; opacity: .8; }
+.tab { flex: 1 1 0; min-width: 56px; padding: 7px 8px; gap: 6px; }
+.tab .x { visibility: hidden; }
+.tab:hover .x, .tab[aria-selected="true"] .x { visibility: visible; }
+.tab.next-out { box-shadow: inset 0 -2px 0 var(--warn); }
+.tab .evict { border: 0; padding: 0; font-size: 12px; opacity: 1; text-transform: none; letter-spacing: 0; }
+.tabs { overflow: hidden; }
+.tab-actions { flex: none; }
+.mem .more { color: var(--muted); font-size: 11px; line-height: 18px; padding: 0 2px; }
+button.tag-error { background: none; border: 1px dashed var(--warn); border-radius: 10px; padding: 0 7px; line-height: 16px; }
+button.tag-error:hover { background: rgba(224, 164, 88, .12); }
+
+.terms.dropping::after {
+  content: "Drop to attach — the file's path is pasted into this tab"; position: absolute; inset: 8px; z-index: 10;
+  border: 2px dashed var(--accent); border-radius: 10px; background: rgba(138, 180, 248, .08);
+  display: grid; place-items: center; color: var(--accent); font-size: 14px; pointer-events: none;
+}

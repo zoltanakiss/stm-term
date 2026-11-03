@@ -6,7 +6,7 @@ const { DatabaseSync } = require('node:sqlite');
 const COLS = [
   'id', 'title', 'osc_title', 'cwd', 'state', 'kind', 'position', 'created_at', 'last_focused_at',
   'last_active_at', 'evicted_at', 'tags', 'summary', 'tag_status', 'claude_session_id', 'command',
-  'snapshot', 'scrollback', 'cols', 'rows', 'import_source',
+  'snapshot', 'scrollback', 'cols', 'rows', 'import_source', 'agent_session_id',
 ];
 
 function openDb(file) {
@@ -19,7 +19,7 @@ function openDb(file) {
       created_at INTEGER, last_focused_at INTEGER, last_active_at INTEGER, evicted_at INTEGER,
       tags TEXT DEFAULT '[]', summary TEXT DEFAULT '', tag_status TEXT DEFAULT 'none',
       claude_session_id TEXT, command TEXT, snapshot TEXT, scrollback TEXT DEFAULT '',
-      cols INTEGER, rows INTEGER, import_source TEXT
+      cols INTEGER, rows INTEGER, import_source TEXT, agent_session_id TEXT
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS tabs_fts USING fts5(id UNINDEXED, title, tags, summary, cwd, scrollback);
   `);
@@ -27,6 +27,11 @@ function openDb(file) {
   // Migrations for databases created by earlier versions.
   const have = new Set(db.prepare('PRAGMA table_info(tabs)').all().map((c) => c.name));
   if (!have.has('import_source')) db.exec('ALTER TABLE tabs ADD COLUMN import_source TEXT');
+  if (!have.has('agent_session_id')) {
+    // Was Claude-only (claude_session_id); now any agent.
+    db.exec('ALTER TABLE tabs ADD COLUMN agent_session_id TEXT');
+    db.exec('UPDATE tabs SET agent_session_id = claude_session_id WHERE claude_session_id IS NOT NULL');
+  }
 
   const upsert = db.prepare(
     `INSERT OR REPLACE INTO tabs (${COLS.join(',')}) VALUES (${COLS.map(() => '?').join(',')})`

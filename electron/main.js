@@ -33,10 +33,12 @@ async function ensureDaemon() {
 app.whenReady().then(async () => {
   await ensureDaemon();
   const win = new BrowserWindow({
-    width: 1440, height: 900, backgroundColor: '#16171d', title: 'STM Term', titleBarStyle: 'default',
-    webPreferences: { contextIsolation: true, nodeIntegration: false },
+    width: 1440, height: 900, show: process.env.STM_HIDDEN !== '1', // hidden for agent QA backgroundColor: '#16171d', title: 'STM Term', titleBarStyle: 'default',
+    webPreferences: { contextIsolation: true, nodeIntegration: false, preload: path.join(__dirname, 'preload.js') },
   });
   win.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: 'deny' }; });
+  // Never navigate away from the app (e.g. to a file dropped outside the terminal area).
+  win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(URL)) e.preventDefault(); });
   win.loadURL(URL);
 });
 app.on('window-all-closed', () => app.quit());
