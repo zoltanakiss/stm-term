@@ -112,3 +112,4 @@ kbd { background: var(--panel-2); border: 1px solid var(--border); border-radius
 [hidden] { display: none !important; }
 .mem > div:nth-child(2) { min-width: 0; }
 .ltm-list { overflow-x: hidden; }
+.mem .status.elsewhere { color: var(--warn); }

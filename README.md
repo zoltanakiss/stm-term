@@ -50,6 +50,12 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
 - **Session-marker scrubbing** (`src/env.js`): if the daemon is started from inside Claude Code, its
   `CLAUDE_CODE_CHILD_SESSION` and similar variables would leak into tabs. Claude would then turn
   transcript saving off, which breaks `--resume` and tagging.
+- **Existing Claude Code sessions are imported** (`src/importer.js`) from `~/.claude/projects/*/*.jsonl`
+  on startup and every 60s. Only interactive sessions (`entrypoint: "cli"`) with a real human message
+  are imported; SDK/background sessions and temp-dir sessions are skipped. Claude's own `ai-title` is
+  kept as the title. Haiku tags them in the background, 2 at a time, newest first. Sessions touched in
+  the last 10 min show "active elsewhere" and are re-tagged only once they settle. Forgetting one
+  leaves a tombstone so it isn't re-imported. Disable with `STM_IMPORT_CLAUDE=0`.
 - **Security:** binds only to 127.0.0.1, rejects foreign `Host` headers (DNS rebinding), and requires
   an `x-stm: 1` header on mutations (a cross-site POST can't send it without a CORS preflight, which
   is never approved). The WebSocket checks `Origin`.

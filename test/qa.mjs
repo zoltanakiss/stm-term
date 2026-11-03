@@ -18,6 +18,17 @@ const REAL = !!process.env.STM_QA_REAL;
 fs.mkdirSync(ART, { recursive: true });
 
 let data = fs.mkdtempSync(path.join(os.tmpdir(), 'stm-qa-'));
+// Fixture Claude Code transcripts: one interactive session (should import), one SDK session (should not).
+const FIX_SID = '11111111-2222-4333-8444-555555555555';
+const fixDir = path.join(data, 'claude-projects', '-fixture-foxtrot');
+fs.mkdirSync(fixDir, { recursive: true });
+const line = (o) => JSON.stringify(o) + '\n';
+fs.writeFileSync(path.join(fixDir, `${FIX_SID}.jsonl`),
+  line({ type: 'user', entrypoint: 'cli', cwd: '/tmp/foxtrot-billing', sessionId: FIX_SID, gitBranch: 'main', message: { role: 'user', content: 'Migrate foxtrot billing webhooks to the new queue' } })
+  + line({ type: 'assistant', entrypoint: 'cli', cwd: '/tmp/foxtrot-billing', sessionId: FIX_SID, message: { role: 'assistant', content: [{ type: 'text', text: 'Moved the webhook handler onto the queue; tests pass.' }] } })
+  + line({ type: 'ai-title', aiTitle: 'Foxtrot billing webhook queue migration', sessionId: FIX_SID }));
+fs.writeFileSync(path.join(fixDir, '99999999-2222-4333-8444-555555555555.jsonl'),
+  line({ type: 'user', entrypoint: 'sdk-cli', cwd: '/tmp/observer', message: { role: 'user', content: 'background observer prompt' } }));
 let daemon;
 const results = [];
 const check = (name, ok, detail = '') => { results.push({ name, ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`); };
@@ -32,7 +43,7 @@ async function until(fn, ms = 15000, step = 150) {
 
 function startDaemon() {
   daemon = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', 'src/server.js'], {
-    cwd: ROOT, env: { ...process.env, STM_PORT: String(PORT), STM_DATA_DIR: data, STM_TAGGER: REAL ? 'claude' : 'fake', STM_SHELL: '/bin/zsh' },
+    cwd: ROOT, env: { ...process.env, STM_PORT: String(PORT), STM_DATA_DIR: data, STM_TAGGER: REAL ? 'claude' : 'fake', STM_SHELL: '/bin/zsh', STM_CLAUDE_PROJECTS: path.join(data, 'claude-projects') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   daemon.stderr.on('data', (d) => process.stderr.write(`[daemon] ${d}`));
@@ -53,6 +64,20 @@ async function main() {
   await page.goto(BASE);
   await page.waitForSelector('#empty:not([hidden])');
   check('empty state shown on fresh data dir', true);
+
+  // 0. Existing Claude Code sessions are imported into long-term memory (interactive only).
+  const imported = await until(async () => {
+    const m = await api('GET', '/api/memory');
+    return m.items.length >= 1 && m.items.every((x) => x.tag_status === 'done') && m.items;
+  }, REAL ? 60000 : 8000);
+  const fx = imported && imported.find((x) => x.claude_session_id === FIX_SID);
+  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 1 && !!fx && fx.tags.length > 0,
+    imported ? `${imported.length} item(s): "${fx && fx.title}" [${fx && fx.tags.join(', ')}]` : 'timeout');
+  check('imported session keeps Claude ai-title', fx && fx.title === 'Foxtrot billing webhook queue migration');
+  await page.fill('[data-testid=ltm-search]', 'webhook queue');
+  await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 1, 3000);
+  check('search finds imported session by transcript text', await page.locator(`[data-testid=memory-item][data-id="${fx && fx.id}"]`).count() === 1);
+  await page.fill('[data-testid=ltm-search]', '');
 
   // 1. Open 5 shells through the UI, each in a distinct project dir, tag each with a marker.
   const dirs = ['alpha-api', 'bravo-web', 'charlie-infra', 'delta-docs', 'echo-ml'].map((n) => {
@@ -94,7 +119,7 @@ async function main() {
   const tagged = await until(async () => {
     const m = await api('GET', '/api/memory');
     const it = m.items.find((x) => x.id === ids[2]);
-    return it && it.tag_status !== 'pending' && it;
+    return it && it.tag_status === 'done' && it;
   }, REAL ? 90000 : 10000);
   check('evicted tab gets tags', tagged && tagged.tag_status === 'done' && tagged.tags.length >= 2, tagged ? `${tagged.tag_status}: [${tagged.tags.join(', ')}] "${tagged.title}" — ${tagged.summary}` : 'timeout');
   check('evicted tab cwd captured', tagged && tagged.cwd && tagged.cwd.endsWith('charlie-infra'), tagged && tagged.cwd);
@@ -117,11 +142,11 @@ async function main() {
 
   // Evict a second tab so tag filtering has something to exclude.
   await page.click('[data-testid=new-shell]');
-  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status !== 'pending').length === 2, REAL ? 90000 : 10000);
+  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 3, REAL ? 90000 : 10000);
   const mem2 = await api('GET', '/api/memory');
   const target = mem2.items.find((x) => x.id === ids[2]);
-  const other = mem2.items.find((x) => x.id !== ids[2]);
-  const uniqueTag = target.tags.find((g) => !other.tags.includes(g));
+  const others = mem2.items.filter((x) => x.id !== ids[2]);
+  const uniqueTag = target.tags.find((g) => others.every((o) => !o.tags.includes(g)));
   await page.waitForSelector(`[data-testid=memory-item][data-id="${ids[2]}"] [data-testid=mem-tag]`);
   await page.locator(`[data-testid=memory-item][data-id="${ids[2]}"] [data-testid=mem-tag]`, { hasText: uniqueTag }).first().click();
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 1, 3000);
@@ -129,8 +154,8 @@ async function main() {
   check(`clicking tag "${uniqueTag}" filters memory`, filtered.length === 1 && filtered[0] === ids[2] && await page.locator('#filter:not([hidden])').count() === 1, `${filtered.length} item(s)`);
   await page.screenshot({ path: path.join(ART, '03-tag-filter.png') });
   await page.click('[data-testid=tag-filter]');
-  await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 2, 3000);
-  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 2);
+  await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 3, 3000);
+  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 3);
 
   // 5. Click a memory → it comes back to short-term, stalest goes out, live process reattaches.
   const before = await api('GET', '/api/state');
@@ -164,7 +189,15 @@ async function main() {
   }, 8000);
   check('snapshot replayed after restart', !!restoredAfter);
   const memAfter = await api('GET', '/api/memory');
-  check('long-term memory persisted across restart', memAfter.items.length === 3, `${memAfter.items.length} items`);
+  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 4, `${memAfter.items.length} items`);
+
+  // Forgetting an imported session sticks across rescans/restarts.
+  await api('DELETE', `/api/memory/${fx.id}`);
+  await stopDaemon(); await startDaemon();
+  await sleep(1500);
+  const memForgot = await api('GET', '/api/memory');
+  check('forgotten imported session is not re-imported', !memForgot.items.some((x) => x.claude_session_id === FIX_SID), `${memForgot.items.length} items`);
+  await page.reload();
 
   // 8. Security: cross-site mutation without the header is refused; foreign Host is refused.
   const noHeader = await fetch(`${BASE}/api/tabs`, { method: 'POST', body: '{}' });

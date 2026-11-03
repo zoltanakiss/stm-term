@@ -14,6 +14,7 @@ const { openDb } = require('./db');
 const procinfo = require('./procinfo');
 const tagger = require('./tagger');
 const { cleanEnv } = require('./env');
+const importer = require('./importer');
 
 const PORT = +(process.env.STM_PORT || 4790);
 const DATA = process.env.STM_DATA_DIR || path.join(os.homedir(), '.stm-term');
@@ -21,6 +22,8 @@ const MAX = +(process.env.STM_MAX || 5);
 const SHELL = process.env.STM_SHELL || process.env.SHELL || '/bin/zsh';
 const CLAUDE_CMD = process.env.STM_CLAUDE_CMD || 'claude --chrome --dangerously-skip-permissions';
 const ROOT = path.join(__dirname, '..');
+const IMPORT_CLAUDE = process.env.STM_IMPORT_CLAUDE !== '0';
+const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be open in another terminal
 
 fs.mkdirSync(DATA, { recursive: true });
 const db = openDb(path.join(DATA, 'stm.sqlite'));
@@ -42,8 +45,9 @@ function publicTab(t) {
     id: t.id, title: displayTitle(t), osc_title: t.osc_title, ai_title: t.title, cwd: t.cwd, state: t.state,
     kind: t.kind, position: t.position, created_at: t.created_at, last_focused_at: t.last_focused_at,
     last_active_at: t.last_active_at, evicted_at: t.evicted_at, tags: t.tags || [], summary: t.summary,
-    tag_status: t.tag_status, claude_session_id: t.claude_session_id,
+    tag_status: t.tag_status, claude_session_id: t.claude_session_id, import_source: t.import_source || null,
     process: L ? (L.exited ? 'exited' : 'running') : 'snapshot',
+    active_elsewhere: !L && t.import_source === 'claude' && now() - (t.last_active_at || 0) < ACTIVE_WINDOW,
   };
 }
 function snapshotState() {
@@ -242,13 +246,62 @@ async function tagTab(t, L) {
       title: t.osc_title || displayTitle(t), cwd: t.cwd, git: info.git, processes: info.processes,
       claude: info.claude, scrollback: t.scrollback, previousTags: t.tags,
     });
-    Object.assign(t, { title: out.title || t.title, tags: out.tags, summary: out.summary, tag_status: 'done' });
+    const keepTitle = t.import_source === 'claude' && t.osc_title; // Claude's own ai-title beats ours
+    Object.assign(t, { title: keepTitle ? t.osc_title : (out.title || t.title), tags: out.tags, summary: out.summary, tag_status: 'done' });
   } catch (e) {
     t.tag_status = 'error';
     t.summary = t.summary || `tagging failed: ${String(e.message || e).slice(0, 120)}`;
     console.error('[tagger]', e.message || e);
   }
   if (tabs.has(t.id)) { save(t); memChanged(); }
+}
+
+// Background tagging for imported sessions: newest first, a couple at a time.
+const tagQueue = new Set();
+let tagRunning = 0;
+const TAG_CONCURRENCY = +(process.env.STM_TAG_CONCURRENCY || 2);
+function queueTag(t) { tagQueue.add(t.id); pumpTags(); }
+function pumpTags() {
+  while (tagRunning < TAG_CONCURRENCY && tagQueue.size) {
+    const next = [...tagQueue].map((id) => tabs.get(id)).filter(Boolean)
+      .sort((a, b) => (b.last_active_at || 0) - (a.last_active_at || 0))[0];
+    if (!next) { tagQueue.clear(); return; }
+    tagQueue.delete(next.id);
+    if (next.state !== 'ltm') continue;
+    tagRunning++;
+    next.tag_status = 'pending';
+    memChanged();
+    tagTab(next, null).finally(() => { tagRunning--; pumpTags(); });
+  }
+}
+
+const importHooks = {
+  create(fields) {
+    const t = {
+      id: crypto.randomUUID(), state: 'ltm', kind: 'claude', import_source: 'claude', position: 0,
+      last_focused_at: 0, evicted_at: fields.last_active_at, tags: [], summary: '', tag_status: 'queued',
+      ...fields, osc_title: fields.title,
+    };
+    tabs.set(t.id, t);
+    save(t);
+    queueTag(t);
+  },
+  update(t, fields) {
+    Object.assign(t, fields, { osc_title: fields.title, evicted_at: fields.last_active_at });
+    // Still being worked on elsewhere: mark stale and re-tag once it settles, not every minute.
+    t.tag_status = now() - fields.last_active_at < ACTIVE_WINDOW ? 'stale' : 'queued';
+    save(t);
+    if (t.tag_status === 'queued') queueTag(t);
+  },
+};
+function runImport() {
+  if (!IMPORT_CLAUDE) return;
+  let n = 0;
+  try { n = importer.scan(tabs, importHooks); } catch (e) { console.error('[import]', e); }
+  for (const t of tabs.values()) {
+    if (t.state === 'ltm' && t.tag_status === 'stale' && now() - (t.last_active_at || 0) >= ACTIVE_WINDOW) { t.tag_status = 'queued'; queueTag(t); }
+  }
+  if (n) { console.log(`[import] ${n} Claude session(s) new/updated`); memChanged(); }
 }
 
 function restore(id) {
@@ -278,8 +331,14 @@ function forget(id) {
   const L = live.get(id);
   if (L && !L.exited) L.pty.kill();
   live.delete(id);
-  tabs.delete(id);
-  db.remove(id);
+  if (t.claude_session_id) {
+    // Tombstone, so the Claude-session importer doesn't bring it back on the next scan.
+    Object.assign(t, { state: 'forgotten', snapshot: null, scrollback: '', tags: [], summary: '' });
+    save(t);
+  } else {
+    tabs.delete(id);
+    db.remove(id);
+  }
   memChanged();
   return true;
 }
@@ -402,6 +461,7 @@ server.on('upgrade', (req, socket, head) => {
 setInterval(() => {
   for (const t of stmTabs()) refreshCwd(t);
 }, 3000).unref();
+setInterval(runImport, 60000).unref();
 setInterval(() => {
   for (const [id] of live) { const t = tabs.get(id); if (t) persistSnapshot(t); }
 }, 20000).unref();
@@ -421,5 +481,10 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`stm-term daemon on http://127.0.0.1:${PORT}  data=${DATA}  max=${MAX}`);
   // Tabs that were open when the daemon last stopped come back as snapshots with fresh shells.
   for (const t of stmTabs()) if (!live.has(t.id)) spawnLive(t, { replay: true, command: resumeCommand(t) });
+  // Drop tags we no longer emit (e.g. claude-code) from older rows.
+  for (const t of tabs.values()) if ((t.tags || []).some((g) => tagger.NOISE.has(g))) { t.tags = t.tags.filter((g) => !tagger.NOISE.has(g)); save(t); }
+  // Tagging interrupted by a previous shutdown resumes now.
+  for (const t of tabs.values()) if (t.state === 'ltm' && (t.tag_status === 'queued' || t.tag_status === 'pending')) queueTag(t);
   broadcastState();
+  setTimeout(runImport, 200);
 });

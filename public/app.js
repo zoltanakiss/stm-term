@@ -166,8 +166,8 @@ function renderMemory(items, tagCounts) {
     const ts = t.last_active_at || t.evicted_at;
     const day = dayLabel(ts);
     if (day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
-    const tags = t.tag_status === 'pending'
-      ? '<span class="tagging" data-testid="tagging">tagging…</span>'
+    const tags = t.tag_status === 'pending' || (t.tag_status === 'queued' && !t.tags.length)
+      ? `<span class="tagging" data-testid="tagging">${t.tag_status === 'pending' ? 'tagging…' : 'queued for tagging'}</span>`
       : t.tags.map((g) => `<button class="tag ${g === tagFilter ? 'active' : ''}" data-tag="${esc(g)}" data-testid="mem-tag">${esc(g)}</button>`).join('')
         + (t.tag_status === 'error' ? '<span class="tag-error">tagging failed</span>' : '');
     html += `
@@ -181,7 +181,9 @@ function renderMemory(items, tagCounts) {
         </div>
         <div class="right">
           <span class="time" title="${esc(new Date(ts).toLocaleString())}">${rel(ts)}</span>
-          <span class="status ${t.process}" title="${t.process === 'running' ? 'process still running in the background' : 'saved snapshot; a new shell starts on restore'}">${t.process === 'running' ? '● live' : 'snapshot'}</span>
+          ${t.active_elsewhere
+            ? '<span class="status elsewhere" title="This Claude session was active in the last 10 minutes; it may still be open in another terminal">active elsewhere</span>'
+            : `<span class="status ${t.process}" title="${t.process === 'running' ? 'process still running in the background' : t.kind === 'claude' ? 'restores with claude --resume' : 'saved snapshot; a new shell starts on restore'}">${t.process === 'running' ? '● live' : t.import_source === 'claude' ? 'claude session' : 'snapshot'}</span>`}
           <button class="forget" data-forget="${t.id}" title="Forget permanently" data-testid="forget">×</button>
         </div>
       </div>`;

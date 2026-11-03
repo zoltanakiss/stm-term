@@ -46,4 +46,6 @@ try {
   console.log('screen shows prior conversation:', (await text(tab.id)).includes('Usage'));
 } finally {
   await api('POST', '/api/shutdown').catch(() => {}); await sleep(500); d.kill();
+  // Don't leave test sessions behind in your real ~/.claude/projects.
+  for (const dir of [proj, data]) fs.rmSync(path.join(os.homedir(), '.claude', 'projects', fs.realpathSync(dir).replace(/[^a-zA-Z0-9]/g, '-')), { recursive: true, force: true });
 }
