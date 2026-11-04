@@ -46,6 +46,9 @@ fs.writeFileSync(path.join(fixDir, `${SEARCH_B}.jsonl`),
   + turn(SEARCH_B, 'assistant', [{ type: 'text', text: 'Looked at https://ledger-round9.example.test/ and it loads.' }]));
 fs.writeFileSync(path.join(fixDir, '99999999-2222-4333-8444-555555555555.jsonl'),
   line({ type: 'user', entrypoint: 'sdk-cli', cwd: '/tmp/observer', message: { role: 'user', content: 'background observer prompt' } }));
+// Default tab directory comes from config.json (the path a Finder-launched app relies on).
+const DEFAULT_DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'stm-qa-home-')));
+fs.writeFileSync(path.join(data, 'config.json'), JSON.stringify({ defaultCwd: DEFAULT_DIR }));
 // Fixture Codex home: one interactive TUI session (import, titled via session_index), one `codex exec` (skip).
 const CODEX_SID = '01a1cccc-1111-7222-8333-444444444444';
 const codexHome = path.join(data, 'codex-home');
@@ -340,6 +343,18 @@ async function main() {
   const badHost = await new Promise((resolve) => http.get({ host: '127.0.0.1', port: PORT, path: '/api/state', headers: { host: 'evil.example' } },
     (res) => { res.resume(); resolve({ status: res.statusCode }); }).on('error', () => resolve({ status: 0 })));
   check('foreign Host header refused', badHost.status === 403);
+
+  // 9. A tab opened with no cwd starts in the configured default; ?lines= counts from the last
+  // non-blank row (after `clear` the bottom of the screen is blank).
+  const h = await api('GET', '/api/health');
+  check('health reports configured default cwd', h.defaultCwd === DEFAULT_DIR, h.defaultCwd);
+  const fresh = await api('POST', '/api/tabs', {});
+  check('tab with no cwd opens in the default dir', fresh.cwd === DEFAULT_DIR, fresh.cwd);
+  await sleep(1500);
+  await api('POST', `/api/tabs/${fresh.id}/input`, { data: 'clear; pwd; echo LINES-$((6*7))\r' });
+  const tail = await until(async () => { const r = await api('GET', `/api/tabs/${fresh.id}/text?lines=5`); return r.text.includes('LINES-42') && r.text; }, 8000);
+  check('?lines=5 returns the output after clear', !!tail);
+  check('shell actually started in the default dir', !!tail && tail.includes(DEFAULT_DIR), tail || '');
 
   await page.screenshot({ path: path.join(ART, '05-after-restart.png') });
   const all = await api('GET', '/api/memory');
