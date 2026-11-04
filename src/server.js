@@ -16,6 +16,8 @@ const tagger = require('./tagger');
 const { cleanEnv } = require('./env');
 const importer = require('./importer');
 const { agents } = require('./agents');
+const { Worker } = require('worker_threads');
+const search = require('./search');
 
 const PORT = +(process.env.STM_PORT || 4790);
 const DATA = process.env.STM_DATA_DIR || path.join(os.homedir(), '.stm-term');
@@ -30,6 +32,32 @@ const ACTIVE_WINDOW = 10 * 60 * 1000; // a session touched this recently may be 
 
 fs.mkdirSync(DATA, { recursive: true });
 const db = openDb(path.join(DATA, 'stm.sqlite'));
+// Conversation index (see src/search.js). Opened here first so the schema exists before the worker
+// starts; the worker writes, this connection only reads.
+const SEARCH_FILE = path.join(DATA, 'search.sqlite');
+const sdb = search.open(SEARCH_FILE);
+const indexState = { sessions: 0, transcriptBytes: 0, scanning: false, done: 0, total: 0, lastScanMs: null, errors: 0 };
+let indexer = null;
+function startIndexer() {
+  if (process.env.STM_INDEX === '0') return;
+  indexer = new Worker(path.join(__dirname, 'index-worker.js'), { workerData: { file: SEARCH_FILE } });
+  indexer.unref();
+  indexer.on('message', (m) => {
+    if (m.type === 'progress') Object.assign(indexState, { scanning: true, done: m.done, total: m.total });
+    else if (m.type === 'scanned') {
+      Object.assign(indexState, { scanning: false, done: m.done, total: m.total, lastScanMs: m.ms, sessions: m.sessions, transcriptBytes: m.transcriptBytes });
+      if (m.bytes) { console.log(`[index] ${m.done} session(s) checked, ${(m.bytes / 1e6).toFixed(1)} MB new transcript in ${m.ms} ms`); memChanged(); }
+    } else if (m.type === 'error') { indexState.errors++; console.error('[index]', m.sessionId, m.error); }
+  });
+  indexer.on('error', (e) => console.error('[index] worker died:', e.message));
+}
+function indexSessions() {
+  if (!indexer) return;
+  const sessions = [...tabs.values()].filter((t) => t.agent_session_id && t.state !== 'forgotten' && agents[t.kind])
+    .map((t) => ({ sessionId: t.agent_session_id, kind: t.kind }));
+  indexState.scanning = true;
+  indexer.postMessage({ type: 'scan', sessions });
+}
 const tabs = new Map(db.all().map((t) => [t.id, t]));
 for (const t of tabs.values()) t.agent_session_id = t.agent_session_id || t.claude_session_id || null;
 const live = new Map(); // id -> { pty, term, ser, exited }
@@ -295,6 +323,7 @@ async function tagTab(t, L) {
     const out = await tagger.tag({
       title: t.osc_title || displayTitle(t), cwd: t.cwd, git: info.git, processes: info.processes,
       agent: info.agent, scrollback: t.scrollback, previousTags: t.tags,
+      produced: t.agent_session_id ? search.producedOf(sdb, t.agent_session_id) : [],
     });
     const keepTitle = t.import_source && t.osc_title; // the agent's own session title beats ours
     Object.assign(t, { title: keepTitle ? t.osc_title : (out.title || t.title), tags: out.tags, summary: out.summary, tag_status: 'done' });
@@ -382,6 +411,7 @@ function forget(id) {
   if (L && !L.exited) L.pty.kill();
   live.delete(id);
   if (t.agent_session_id) {
+    if (indexer) indexer.postMessage({ type: 'forget', sessionId: t.agent_session_id });
     // Tombstone, so the Claude-session importer doesn't bring it back on the next scan.
     Object.assign(t, { state: 'forgotten', snapshot: null, scrollback: '', tags: [], summary: '' });
     save(t);
@@ -393,17 +423,56 @@ function forget(id) {
   return true;
 }
 
+// Recency for the sidebar: the later of last activity and when it left the tab bar, so a tab you
+// just closed is at the top even if it had been idle for an hour.
+const recency = (t) => Math.max(t.last_active_at || 0, t.evicted_at || 0);
+
+// With a query, results come back in match order, best first:
+//   0 the session produced it (a URL, branch or file it introduced), when that is specific: a
+//     word that matches what 30 sessions produced (a repo name in every path) is not a signal
+//   1 the title, tags or summary match
+//   2 the conversation matches: all words close together, then all words anywhere in it
+//     (ranked by how much of the conversation matches)
+//   3 only the last screen matches
+// Each result says where it matched and shows the matching text.
 function searchMemory(q, tag) {
   let rows = [...tabs.values()].filter((t) => t.state === 'ltm');
-  if (q && q.trim()) {
-    const ids = db.searchIds(q);
-    if (ids) { const rank = new Map(ids.map((id, i) => [id, i])); rows = rows.filter((r) => rank.has(r.id)); }
-  }
   if (tag) rows = rows.filter((r) => (r.tags || []).includes(tag));
-  rows.sort((a, b) => (b.last_active_at || b.evicted_at || 0) - (a.last_active_at || a.evicted_at || 0));
   const tagCounts = {};
   for (const t of tabs.values()) if (t.state === 'ltm') for (const g of t.tags || []) tagCounts[g] = (tagCounts[g] || 0) + 1;
-  return { items: rows.map(publicTab), tagCounts };
+  if (!(q && q.trim() && search.WORDS(q).length)) {
+    rows.sort((a, b) => recency(b) - recency(a));
+    return { items: rows.map(publicTab), tagCounts };
+  }
+  const meta = new Set(db.searchIds(q, ['title', 'tags', 'summary']) || []);
+  const screen = new Set(db.searchIds(q) || []);
+  let convo = new Map();
+  let made = new Map();
+  try { convo = search.searchConversations(sdb, q); made = search.searchProduced(sdb, q); } catch (e) { console.error('[search]', e.message); }
+  const SPECIFIC = 5;
+  if (made.size > SPECIFIC) made = new Map();
+  const hits = [];
+  for (const t of rows) {
+    const sid = t.agent_session_id;
+    const c = sid && convo.get(sid);
+    const m = sid && made.get(sid);
+    let match = null;
+    if (m) match = { where: 'produced', tier: 0, text: m.join('  ·  ') };
+    else if (meta.has(t.id)) match = { where: 'title', tier: 1 };
+    else if (c) match = { where: 'conversation', tier: c.spread ? 2.5 : 2 };
+    else if (screen.has(t.id)) match = { where: 'screen', tier: 3 };
+    if (!match) continue;
+    hits.push({ t, match, score: c ? c.score : 0, chunks: c ? c.chunks : 0, best: c ? c.best : null });
+  }
+  hits.sort((a, b) => a.match.tier - b.match.tier || a.score - b.score || recency(b.t) - recency(a.t));
+  const items = hits.slice(0, 200).map(({ t, match, chunks, best }, i) => {
+    let text = match.text || '';
+    if (!text && i < 60 && best) {
+      try { text = search.snippet(sdb, q, best); } catch {}
+    }
+    return { ...publicTab(t), match: { where: match.where, text, chunks } };
+  });
+  return { items, tagCounts, ranked: true };
 }
 
 // ---------- HTTP ----------
@@ -455,7 +524,7 @@ const server = http.createServer(async (req, res) => {
   const body = req.method === 'GET' ? {} : await readBody(req);
   let m;
   try {
-    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX });
+    if (p === '/api/health') return json(res, 200, { ok: true, pid: process.pid, data: DATA, max: MAX, index: indexState });
     if (p === '/api/state') return json(res, 200, snapshotState());
     if (p === '/api/memory' && req.method === 'GET') return json(res, 200, searchMemory(url.searchParams.get('q'), url.searchParams.get('tag')));
     if (p === '/api/tabs' && req.method === 'POST') return json(res, 200, publicTab(createTab(body)));
@@ -523,7 +592,7 @@ server.on('upgrade', (req, socket, head) => {
 setInterval(() => {
   for (const t of stmTabs()) { refreshCwd(t); refreshAgentSession(t); }
 }, 3000).unref();
-setInterval(runImport, 60000).unref();
+setInterval(() => { runImport(); indexSessions(); }, 60000).unref();
 setInterval(() => {
   for (const [id] of live) { const t = tabs.get(id); if (t) persistSnapshot(t); }
 }, 20000).unref();
@@ -551,6 +620,7 @@ server.listen(PORT, '127.0.0.1', () => {
     try { console.log(`[codex] SessionStart hook: ${agents.codex.ensureHook()}`); } catch (e) { console.error('[codex] hook install failed', e.message); }
   }
   broadcastState();
-  setTimeout(runImport, 200);
+  startIndexer();
+  setTimeout(() => { runImport(); indexSessions(); }, 200);
   pruneUploads();
 });

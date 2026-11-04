@@ -60,10 +60,12 @@ function openDb(file) {
       delFts.run(id);
     },
     // Prefix-AND full-text search; returns matching ids.
-    searchIds(q) {
+    // Optionally restricted to some columns (e.g. ['title', 'tags', 'summary']).
+    searchIds(q, columns = null) {
       const words = (q.toLowerCase().match(/[\p{L}\p{N}_]+/gu) || []).slice(0, 12);
       if (!words.length) return null;
-      const expr = words.map((w) => `"${w}"*`).join(' ');
+      const all = words.map((w) => `"${w}"*`).join(' AND ');
+      const expr = columns ? `{${columns.join(' ')}} : (${all})` : all;
       return db.prepare('SELECT id FROM tabs_fts WHERE tabs_fts MATCH ? ORDER BY rank').all(expr).map((r) => r.id);
     },
   };
