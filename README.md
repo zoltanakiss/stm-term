@@ -43,6 +43,7 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
               ├─ node-pty per tab + @xterm/headless mirror (text + serialized snapshot)
               ├─ memory rules: max 5 STM, LRU eviction, restore, close, forget
               ├─ SQLite (node:sqlite) + FTS5 at ~/.stm-term/stm.sqlite
+              ├─ conversation index: worker thread → ~/.stm-term/search.sqlite
               └─ tagger: Haiku via `claude -p` (your login) or ANTHROPIC_API_KEY
 ```
 
@@ -76,8 +77,32 @@ Electron (thin window) ──► http://127.0.0.1:4790  ◄── headless Chrom
   "active elsewhere" (it may be open in another terminal) and is re-tagged only once it goes quiet.
   Forgetting an imported session leaves a tombstone, so the importer doesn't bring it back.
   Disable with `STM_IMPORT_CLAUDE=0`.
+- **Search reads whole conversations, not screens.** Every agent session in memory has its transcript
+  indexed (`src/search.js`, kept current by a worker thread in `src/index-worker.js`): your messages, the
+  agent's replies, and its tool-call inputs (commands, paths, URLs). Tool *outputs* are left out; they're
+  most of a transcript's bytes and mostly noise. Each 60 s pass reads only the bytes appended since the
+  last pass. On a laptop with 925 sessions (2.5 GB of transcripts) the first pass took 12 s and built a
+  124 MB index, and searches answer in 5–500 ms. The index lives in its own file, so deleting
+  `search.sqlite` is always safe: it rebuilds on the next start. Disable with `STM_INDEX=0`.
+- **Search results are ranked and say why they matched:**
+  1. **made**: the session *produced* it. That means a URL it reported in a reply, a branch it created
+     or pushed, or a file it wrote, not counting anything you pasted in first. "Which session made this
+     link" is one search, and a session where you only pasted the link ranks below it. Only counts when
+     specific (5 or fewer sessions match), so a repo name in every file path doesn't swamp the ranking.
+  2. **title**: the title, tags or summary match.
+  3. **said**: the conversation matches. Sessions with all the words close together come first, then
+     sessions with every word somewhere in them. Within each group, sessions where more of the
+     conversation matches rank higher, so the session that did the work beats one that mentioned it once.
+  4. **screen**: only the last screen matches.
+
+  Each result shows the matching text, highlighted. Without a query, memory is sorted by the later of
+  last activity and when the tab left the tab bar, so a tab you just closed is at the top.
 - **Tagging input:** title, cwd, git repo and branch, child processes, the last ~120 lines of output and,
-  for Claude tabs, the transcript (first ask plus recent turns). Tags are re-generated on every eviction.
+  for agent tabs, the transcript (first ask plus recent turns) and what the session produced. Tags are
+  re-generated on every eviction. Long sessions drift, so the tagger is told to name the original goal
+  (the ticket or feature the first ask named) as well as the current step, and to keep earlier tags
+  for that goal. Otherwise a session filed under "gift card refunds" can't be found as the
+  "multiple coupons" work it started as.
 - **Tagger runs `claude -p --setting-sources project` from an empty temp dir.** That way your user
   hooks (roster, memory, identity minting) don't fire on every tagging call. `--bare` would be cleaner,
   but it requires an API key.
@@ -101,7 +126,8 @@ Every UI action has an API twin, so an agent can check state as data and use pix
 | | |
 |---|---|
 | `GET /api/state` | short-term tabs, focused id, `nextToEvict` |
-| `GET /api/memory?q=&tag=` | long-term items + tag counts |
+| `GET /api/memory?q=&tag=` | long-term items + tag counts; with `q`, ranked, each with `match: {where, text}` |
+| `GET /api/health` | includes `index`: sessions indexed, bytes read, whether a pass is running |
 | `POST /api/tabs {cwd?, claude?}` | open a tab (may evict) |
 | `GET /api/tabs/:id/text?lines=` | plain-text screen of any tab, live or archived |
 | `POST /api/tabs/:id/input {data}` | type into a tab (does **not** refresh staleness) |
@@ -121,3 +147,7 @@ Env: `STM_PORT` (4790) · `STM_DATA_DIR` (~/.stm-term) · `STM_DEFAULT_CWD` (~) 
 
 **Tagging failures** (e.g. the Claude CLI mid auto-update) are retried with backoff, then retried
 again on daemon restart. A failed item shows "tagging failed · retry" in the sidebar; hover it for the reason.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

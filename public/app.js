@@ -147,15 +147,29 @@ function newTab(agent) {
 }
 
 // ---------- long-term memory ----------
+let memSeq = 0;
 async function loadMemory() {
   const qs = new URLSearchParams();
   if (query) qs.set('q', query);
   if (tagFilter) qs.set('tag', tagFilter);
-  const { items, tagCounts } = await api('GET', `/api/memory?${qs}`);
-  renderMemory(items, tagCounts);
+  // Responses can arrive out of order (a broad query is slower than the next one typed); only the
+  // latest request may render, or the list shows results for a query that is no longer in the box.
+  const seq = ++memSeq;
+  const { items, tagCounts, ranked } = await api('GET', `/api/memory?${qs}`);
+  if (seq !== memSeq) return;
+  renderMemory(items, tagCounts, ranked);
 }
 
-function renderMemory(items, tagCounts) {
+// Matching text from the server marks hits with \u0002…\u0003; escape first, then highlight.
+const highlight = (s) => esc(s).replace(/\u0002/g, '<mark>').replace(/\u0003/g, '</mark>');
+const WHERE = { produced: 'made', title: 'title', conversation: 'said', screen: 'screen' };
+function matchLine(m) {
+  if (!m) return '';
+  const label = `<span class="where ${m.where}" title="${m.where === 'produced' ? 'This session introduced it' : m.where === 'conversation' ? `Matches in ${m.chunks} part(s) of the conversation` : m.where === 'screen' ? 'Only its last screen matches' : 'Title, tags or summary match'}">${WHERE[m.where]}</span>`;
+  return m.text ? `<div class="hit" data-testid="match">${label}${highlight(m.text)}</div>` : `<div class="hit" data-testid="match">${label}</div>`;
+}
+
+function renderMemory(items, tagCounts, ranked) {
   $('#filter').hidden = !tagFilter;
   $('#filter-chip').textContent = tagFilter || '';
   const top = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).slice(0, 12);
@@ -166,10 +180,11 @@ function renderMemory(items, tagCounts) {
   }
   let html = '';
   let lastDay = '';
+  if (ranked) html += `<div class="day">Best matches · ${items.length}</div>`;
   for (const t of items) {
-    const ts = t.last_active_at || t.evicted_at;
+    const ts = Math.max(t.last_active_at || 0, t.evicted_at || 0);
     const day = dayLabel(ts);
-    if (day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
+    if (!ranked && day !== lastDay) { html += `<div class="day">${esc(day)}</div>`; lastDay = day; }
     const tags = t.tag_status === 'pending' || (t.tag_status === 'queued' && !t.tags.length)
       ? `<span class="tagging" data-testid="tagging">${t.tag_status === 'pending' ? 'tagging…' : 'queued for tagging'}</span>`
       : t.tags.slice(0, MAX_TAGS).map((g) => `<button class="tag ${g === tagFilter ? 'active' : ''}" data-tag="${esc(g)}" data-testid="mem-tag">${esc(g)}</button>`).join('')
@@ -181,6 +196,7 @@ function renderMemory(items, tagCounts) {
         <div>
           <div class="t">${esc(t.title)}</div>
           ${t.summary ? `<div class="s">${esc(t.summary)}</div>` : ''}
+          ${matchLine(t.match)}
           <div class="p">${esc(home(t.cwd))}</div>
           <div class="tags">${tags}</div>
         </div>

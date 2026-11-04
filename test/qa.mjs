@@ -28,6 +28,22 @@ fs.writeFileSync(path.join(fixDir, `${FIX_SID}.jsonl`),
   line({ type: 'user', entrypoint: 'cli', cwd: '/tmp/foxtrot-billing', sessionId: FIX_SID, gitBranch: 'main', message: { role: 'user', content: 'Migrate foxtrot billing webhooks to the new queue' } })
   + line({ type: 'assistant', entrypoint: 'cli', cwd: '/tmp/foxtrot-billing', sessionId: FIX_SID, message: { role: 'assistant', content: [{ type: 'text', text: 'Moved the webhook handler onto the queue; tests pass.' }] } })
   + line({ type: 'ai-title', aiTitle: 'Foxtrot billing webhook queue migration', sessionId: FIX_SID }));
+// Search fixtures. Session A says "zebrafish" early, long before its last screen, then reports a
+// URL it published; it also curls an API (read, not produced). Session B is someone pasting A's URL.
+const SEARCH_A = '22222222-2222-4333-8444-555555555555';
+const SEARCH_B = '33333333-2222-4333-8444-555555555555';
+const turn = (sid, role, content) => line({ type: role, entrypoint: 'cli', cwd: '/tmp/hotel-ledger', sessionId: sid, message: { role, content } });
+const filler = Array.from({ length: 30 }, (_, i) => turn(SEARCH_A, 'assistant', [{ type: 'text', text: `Step ${i}: compared ledger lines for the hotel group against the bank export; totals agree for this batch. `.repeat(6) }])).join('');
+fs.writeFileSync(path.join(fixDir, `${SEARCH_A}.jsonl`),
+  turn(SEARCH_A, 'user', 'Reconcile the hotel ledger for October')
+  + turn(SEARCH_A, 'assistant', [{ type: 'text', text: 'The zebrafish vendor code is the odd one out; it has no matching bank line.' }])
+  + turn(SEARCH_A, 'assistant', [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'curl -s https://api.example.test/readonly/ledger' } }])
+  + line({ type: 'user', entrypoint: 'cli', cwd: '/tmp/hotel-ledger', sessionId: SEARCH_A, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'kangaroo output that must not be indexed' }] } })
+  + turn(SEARCH_A, 'assistant', [{ type: 'text', text: 'Published the report: https://ledger-round9.example.test/' }])
+  + filler);
+fs.writeFileSync(path.join(fixDir, `${SEARCH_B}.jsonl`),
+  turn(SEARCH_B, 'user', 'can you check https://ledger-round9.example.test/ please')
+  + turn(SEARCH_B, 'assistant', [{ type: 'text', text: 'Looked at https://ledger-round9.example.test/ and it loads.' }]));
 fs.writeFileSync(path.join(fixDir, '99999999-2222-4333-8444-555555555555.jsonl'),
   line({ type: 'user', entrypoint: 'sdk-cli', cwd: '/tmp/observer', message: { role: 'user', content: 'background observer prompt' } }));
 // Default tab directory comes from config.json (the path a Finder-launched app relies on).
@@ -98,7 +114,7 @@ async function main() {
   // 0. Existing Claude Code sessions are imported into long-term memory (interactive only).
   const imported = await until(async () => {
     const m = await api('GET', '/api/memory');
-    return m.items.length >= 2 && m.items.every((x) => x.tag_status === 'done') && m.items;
+    return m.items.length >= 4 && m.items.every((x) => x.tag_status === 'done') && m.items;
   }, REAL ? 60000 : 8000);
   const fx = imported && imported.find((x) => x.agent_session_id === FIX_SID);
   const cx = imported && imported.find((x) => x.agent_session_id === CODEX_SID);
@@ -106,12 +122,39 @@ async function main() {
     cx ? `"${cx.title}" [${cx.tags.join(', ')}]` : 'missing');
   const hooksJson = JSON.parse(fs.readFileSync(path.join(codexHome, 'hooks.json'), 'utf8'));
   check('Codex SessionStart hook installed into hooks.json', JSON.stringify(hooksJson).includes('agent-session-hook.sh'));
-  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 2 && !!fx && fx.tags.length > 0,
+  check('interactive Claude session imported + tagged, SDK session skipped', imported && imported.length === 4 && !!fx && fx.tags.length > 0,
     imported ? `${imported.length} item(s): "${fx && fx.title}" [${fx && fx.tags.join(', ')}]` : 'timeout');
   check('imported session keeps Claude ai-title', fx && fx.title === 'Foxtrot billing webhook queue migration');
   await page.fill('[data-testid=ltm-search]', 'webhook queue');
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 1, 3000);
   check('search finds imported session by transcript text', await page.locator(`[data-testid=memory-item][data-id="${fx && fx.id}"]`).count() === 1);
+  await page.fill('[data-testid=ltm-search]', '');
+
+  // 0b. Conversation search: the whole transcript is indexed, not just the last screen.
+  const idx = await until(async () => { const h = await api('GET', '/api/health'); return h.index && !h.index.scanning && h.index.sessions >= 4 && h.index; }, 15000);
+  check('conversation index covers every imported session', !!idx, idx ? `${idx.sessions} session(s), ${idx.transcriptBytes} bytes` : 'timeout');
+  const q = (s) => api('GET', `/api/memory?q=${encodeURIComponent(s)}`);
+  const zebra = await q('zebrafish');
+  const za = zebra.items.find((x) => x.agent_session_id === SEARCH_A);
+  check('a word from early in a long session is found (not on its last screen)', !!za && za.match.where === 'conversation' && za.match.text.includes('\u0002zebrafish\u0003'),
+    za ? `${za.match.where}: ${za.match.text.slice(0, 80)}` : `${zebra.items.length} result(s)`);
+  const r9 = await q('round9');
+  check('the session that published a URL ranks first, as "produced"', r9.items[0] && r9.items[0].agent_session_id === SEARCH_A && r9.items[0].match.where === 'produced',
+    r9.items.map((x) => `${x.agent_session_id.slice(0, 8)}:${x.match.where}`).join(' '));
+  const bAt = r9.items.findIndex((x) => x.agent_session_id === SEARCH_B);
+  check('a session that only had the URL pasted in is found, below and not as "produced"', bAt > 0 && r9.items[bAt].match.where !== 'produced', bAt >= 0 ? r9.items[bAt].match.where : 'missing');
+  const read = await q('api.example.test');
+  check('a URL the agent only read (curl) is not "produced"', read.items.some((x) => x.agent_session_id === SEARCH_A) && !read.items.some((x) => x.match.where === 'produced'));
+  check('tool output is not indexed', (await q('kangaroo')).items.length === 0);
+  check('search results are ranked (no day headings)', r9.ranked === true);
+  await page.fill('[data-testid=ltm-search]', 'zebrafish');
+  const mark = await until(async () => {
+    const items = page.locator('[data-testid=memory-item]');
+    if (await items.count() !== 1 || await items.first().getAttribute('data-id') !== za.id) return false;
+    return (await page.locator('[data-testid=match] mark').allInnerTexts()).includes('zebrafish');
+  }, 3000);
+  check('search result shows the matching text, highlighted', !!mark);
+  await page.screenshot({ path: path.join(ART, '00-search-snippet.png') });
   await page.fill('[data-testid=ltm-search]', '');
 
   // 1. Open 5 shells through the UI, each in a distinct project dir, tag each with a marker.
@@ -177,7 +220,7 @@ async function main() {
 
   // Evict a second tab so tag filtering has something to exclude.
   await page.click('[data-testid=new-shell]');
-  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 4, REAL ? 90000 : 10000);
+  await until(async () => (await api('GET', '/api/memory')).items.filter((x) => x.tag_status === 'done').length === 6, REAL ? 90000 : 10000);
   const mem2 = await api('GET', '/api/memory');
   const target = mem2.items.find((x) => x.id === ids[2]);
   const others = mem2.items.filter((x) => x.id !== ids[2]);
@@ -190,7 +233,7 @@ async function main() {
   await page.screenshot({ path: path.join(ART, '03-tag-filter.png') });
   await page.click('[data-testid=tag-filter]');
   await until(async () => (await page.locator('[data-testid=memory-item]').count()) === 4, 3000);
-  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 4);
+  check('clearing tag filter shows all', await page.locator('[data-testid=memory-item]').count() === 6);
 
   // 5. Click a memory → it comes back to short-term, stalest goes out, live process reattaches.
   const before = await api('GET', '/api/state');
@@ -225,7 +268,7 @@ async function main() {
   }, 8000);
   check('snapshot replayed after restart', !!restoredAfter);
   const memAfter = await api('GET', '/api/memory');
-  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 5, `${memAfter.items.length} items`);
+  check('long-term memory persisted across restart (no duplicate imports)', memAfter.items.length === 7, `${memAfter.items.length} items`);
 
   // Forgetting an imported session sticks across rescans/restarts.
   await api('DELETE', `/api/memory/${fx.id}`);
@@ -314,6 +357,9 @@ async function main() {
   check('shell actually started in the default dir', !!tail && tail.includes(DEFAULT_DIR), tail || '');
 
   await page.screenshot({ path: path.join(ART, '05-after-restart.png') });
+  const all = await api('GET', '/api/memory');
+  const keys = all.items.map((x) => Math.max(x.last_active_at || 0, x.evicted_at || 0));
+  check('memory is sorted by the later of last activity and when it left the tab bar', keys.every((k, i) => i === 0 || keys[i - 1] >= k));
   check('no browser console errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
   await browser.close();
   await stopDaemon();
