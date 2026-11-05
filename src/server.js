@@ -330,6 +330,22 @@ function archive(t, { kill }) {
 }
 
 const IMAGE_FIRST = /FIRST ASK: \[Image #\d+\]/;
+// An open tab normally shows the agent's own title. When the session started with a pasted screenshot,
+// that title was written without seeing the image ("Image attachment"), so the tab says nothing about
+// the work. Once the agent has replied (its reply says what the image was) and the turn is over, tag
+// it now instead of when it leaves the tab bar. Once per tab per daemon run.
+const PLACEHOLDER_TITLE = /^(image attachment|pasted image|image #?\d*|screenshot)$/i;
+const placeholderTitle = (t) => PLACEHOLDER_TITLE.test((t.osc_title || '').replace(/^[^\p{L}\p{N}]+/u, '').trim());
+const retitleOpen = new Set();
+function retitleOpenTabs() {
+  for (const t of stmTabs()) {
+    if (retitleOpen.has(t.id) || t.title || !placeholderTitle(t)) continue;
+    if (now() - (t.last_active_at || 0) < 15_000) continue; // still working on the first turn
+    retitleOpen.add(t.id);
+    if (live.has(t.id)) persistSnapshot(t); // the tagger reads the scrollback
+    queueTag(t);
+  }
+}
 const imageFirst = (t, info) => IMAGE_FIRST.test(t.scrollback || '') || IMAGE_FIRST.test((info && info.agent && info.agent.transcript) || '');
 
 async function tagTab(t, L) {
@@ -369,11 +385,12 @@ function pumpTags() {
       .sort((a, b) => (b.last_active_at || 0) - (a.last_active_at || 0))[0];
     if (!next) { tagQueue.clear(); return; }
     tagQueue.delete(next.id);
-    if (next.state !== 'ltm') continue;
+    const open = next.state === 'stm' && retitleOpen.has(next.id);
+    if (next.state !== 'ltm' && !open) continue;
     tagRunning++;
     next.tag_status = 'pending';
     memChanged();
-    tagTab(next, null).finally(() => { tagRunning--; pumpTags(); });
+    tagTab(next, open ? live.get(next.id) : null).finally(() => { tagRunning--; if (open) broadcastState(); pumpTags(); });
   }
 }
 
@@ -616,6 +633,7 @@ setInterval(() => {
   for (const t of stmTabs()) { refreshCwd(t); refreshAgentSession(t); }
 }, 3000).unref();
 setInterval(() => { runImport(); indexSessions(); }, 60000).unref();
+setInterval(retitleOpenTabs, 10000).unref();
 setInterval(() => {
   for (const [id] of live) { const t = tabs.get(id); if (t) persistSnapshot(t); }
 }, 20000).unref();

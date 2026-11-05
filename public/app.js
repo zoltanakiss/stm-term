@@ -110,12 +110,20 @@ function applyState(s) {
   $('#ltm-count').textContent = s.ltmCount;
 }
 
+// The tab's name: who asked (when someone else's message started it) and the title. A title we wrote
+// keeps the agent's status glyph (✳ working, ◐ …) from the title the agent set.
+function tabName(t) {
+  const who = (t.requester || '').replace(/\s*\(.*\)\s*$/, '');
+  const glyph = t.ai_title ? ((t.osc_title || '').match(/^[^\p{L}\p{N}]+/u) || [''])[0] : '';
+  const title = who && !t.title.toLowerCase().includes(who.toLowerCase()) ? `${who}: ${t.title}` : t.title;
+  return glyph + title;
+}
 function renderTabs() {
   $('#tabs').innerHTML = S.stm.map((t, i) => `
     <div class="tab ${t.kind} ${t.id === S.nextToEvict ? 'next-out' : ''}" role="tab" tabindex="0" data-testid="stm-tab" data-id="${t.id}"
-      aria-selected="${t.id === S.focusedId}" title="${esc(t.title)} — ${esc(home(t.cwd))}  (⌘${i + 1})">
+      aria-selected="${t.id === S.focusedId}" title="${esc(tabName(t))} — ${esc(home(t.cwd))}  (⌘${i + 1})">
       <span class="k">${icon(t.kind)}</span>
-      <span class="n">${esc(t.title)}</span>
+      <span class="n">${esc(tabName(t))}</span>
       ${t.process === 'exited' ? '<span class="dead" title="process exited">●</span>' : ''}
       ${t.id === S.nextToEvict ? '<span class="evict" data-testid="next-evict" title="Stalest tab: opening another moves it to long-term memory">↓</span>' : ''}
       <span class="x" data-close="${t.id}" data-testid="close-tab" title="Close (⌘W): archive and stop process">×</span>

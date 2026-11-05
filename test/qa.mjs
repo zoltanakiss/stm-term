@@ -371,6 +371,19 @@ async function main() {
   check('?lines=5 returns the output after clear', !!tail);
   check('shell actually started in the default dir', !!tail && tail.includes(DEFAULT_DIR), tail || '');
 
+  // 10. An open tab whose agent titled it blind ("Image attachment") gets a real name once the agent
+  // has replied, with who asked in front: the tab bar is where you look for it.
+  await api('POST', `/api/tabs/${fresh.id}/input`, { data: "printf '\\033]0;✳ Image attachment\\007'; echo 'FIRST REPLY: Maryn (care team) says parcel 99-0000001 is stuck'; sleep 90\r" }); // sleep: the next shell prompt would reset the title
+  const named = await until(async () => {
+    const s = await api('GET', '/api/state');
+    const t = s.stm.find((x) => x.id === fresh.id);
+    return t && t.requester && t;
+  }, 45000, 1000);
+  check('an open screenshot-first tab is retitled after the reply', !!named && !/image attachment/i.test(named.title), named ? named.title : 'not retitled');
+  const tabText = page.locator(`[data-testid=stm-tab][data-id="${fresh.id}"] .n`);
+  await until(async () => (await tabText.innerText()).startsWith('✳ Maryn: '), 5000);
+  check('the tab shows who asked first, keeping the status glyph', (await tabText.innerText()).startsWith('✳ Maryn: '), await tabText.innerText());
+
   await page.screenshot({ path: path.join(ART, '05-after-restart.png') });
   const all = await api('GET', '/api/memory');
   const keys = all.items.map((x) => Math.max(x.last_active_at || 0, x.evicted_at || 0));
